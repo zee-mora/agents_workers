@@ -1,0 +1,7 @@
+{
+  "lapila": {
+    "path": "/home/zae/projects/lapila-management-system",
+    "verify": "npm test -- --run",
+    "url": "http://localhost:8000"
+  }
+}

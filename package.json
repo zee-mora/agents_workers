@@ -1,0 +1,17 @@
+{
+  "name": "agent-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Laptop worker untuk antrean Work Order VPS Monitor (claude -p)",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "test": "node worker.js --selftest"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "playwright": "^1.65.1"
+  }
+}
