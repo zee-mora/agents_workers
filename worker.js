@@ -312,6 +312,30 @@ function selftest() {
   assert.ok(unsafeFile('app/.env') && unsafeFile('.git/config') && !unsafeFile('src/env.js'));
   assert.ok(localUrlOk('http://localhost:8000/x') && !localUrlOk('http://evil.com') && !localUrlOk('file:///etc/passwd'));
   assert.ok(buildPrompt({ context: 'c', goals: ['a', 'b'], files_hint: ['f.js'] }).includes('2. b'));
+  const ui = require('./ui');
+  const tu = (name, input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
+  assert.deepStrictEqual(ui.summarize(tu('Edit', { file_path: '/home/x/proj/app/Foo.php' }), '/home/x/proj'), ['Edit app/Foo.php']);
+  assert.deepStrictEqual(ui.summarize(tu('Bash', { command: 'npm test' }), '/r'), ['Bash npm test']);
+  assert.deepStrictEqual(ui.summarize(tu('Grep', { pattern: 'foo' }), '/r'), ['Grep foo']);
+  assert.deepStrictEqual(ui.summarize(tu('WebFetch', {}), '/r'), ['WebFetch']);
+  assert.deepStrictEqual(ui.summarize({ type: 'assistant', message: { content: [{ type: 'text', text: 'halo\ndunia' }] } }, '/r'), ['halo dunia']);
+  assert.deepStrictEqual(ui.summarize({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: '' }] } }, '/r'), []);
+  assert.deepStrictEqual(ui.summarize({ type: 'system', subtype: 'init' }, '/r'), ['sesi dimulai']);
+  assert.deepStrictEqual(ui.summarize({ type: 'system', subtype: 'hook_started' }, '/r'), []);
+  assert.deepStrictEqual(ui.summarize({ type: 'result' }, '/r'), ['selesai']);
+  assert.deepStrictEqual(ui.summarize({ type: 'zzz' }, '/r'), []);
+  assert.deepStrictEqual(ui.summarize(null, '/r'), []);
+  process.env.WORKER_TOKEN = 'rahasia123';
+  assert.strictEqual(ui.redact('cat /home/x/proj/a rahasia123', '/home/x/proj'), 'cat a [token]');
+  assert.strictEqual(ui.redact('a'.repeat(300), '/r').length, 200);
+  for (let i = 0; i < 501; i++) ui.push('baris ' + i);
+  assert.ok(ui.state.activity.length === 500 && ui.state.activity[0] === 'baris 1');
+  const rq = (method, headers) => ({ method, headers });
+  assert.ok(ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: '127.0.0.1:8787' }), 8787));
+  assert.ok(ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: 'localhost:8787' }), 8787));
+  assert.ok(!ui.csrfOk(rq('POST', { host: '127.0.0.1:8787' }), 8787));
+  assert.ok(!ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: 'evil.com' }), 8787));
+  assert.ok(!ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: '127.0.0.1:9999' }), 8787));
   console.log('selftest OK');
 }
 
