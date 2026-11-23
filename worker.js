@@ -235,6 +235,14 @@ async function processWO(wo) {
   }
 }
 
+// File yang diubah WO dan juga diubah di origin/<target> sejak WO dibuat. Tidak kosong = jangan merge otomatis.
+function mergeClash(dir, branch, target) {
+  const mb = git(dir, 'merge-base', branch, `origin/${target}`);
+  const files = (ref) => new Set(git(dir, 'diff', '--name-only', mb, ref).split('\n').filter(Boolean));
+  const theirs = files(`origin/${target}`);
+  return [...files(branch)].filter((f) => theirs.has(f));
+}
+
 const gitNet = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8', timeout: 60000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 // Job merge setelah admin menekan Approve di VPS. Target branch ditentukan HANYA oleh projects.json laptop
@@ -259,6 +267,8 @@ async function processMerge(wo) {
 
     origBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
     gitNet(dir, 'fetch', 'origin', proj.target);
+    const clash = mergeClash(dir, r.branch, proj.target);
+    if (clash.length) throw new Error(`file ini juga diubah di ${proj.target} sejak WO dibuat: ${clash.join(', ')}. Buat WO baru dari ${proj.target} terbaru atau merge manual.`);
     git(dir, 'switch', proj.target);
     targetPrev = git(dir, 'rev-parse', 'HEAD');
     try { git(dir, 'merge', '--ff-only', `origin/${proj.target}`); } // susul origin; menyimpang = berhenti
@@ -387,6 +397,21 @@ function selftest() {
   const t0 = Date.now();
   setTimeout(wakeUp, 10);
   const sw = sleepWake(60000).then(() => assert.ok(Date.now() - t0 < 1000, 'sleepWake harus selesai lebih awal'));
+  // mergeClash: repo sementara dengan ref origin/main buatan
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clash-'));
+  const g = (...x) => execFileSync('git', ['-C', tmp, '-c', 'user.name=t', '-c', 'user.email=t@t', ...x], { encoding: 'utf8' }).trim();
+  const commit = (file, msg) => { fs.writeFileSync(path.join(tmp, file), msg); g('add', '-A'); g('commit', '-qm', msg); };
+  g('init', '-q', '-b', 'main'); commit('a.txt', 'a0'); commit('b.txt', 'b0');
+  const base0 = g('rev-parse', 'HEAD');
+  g('switch', '-q', '-c', 'wo/x'); commit('a.txt', 'a1');                    // WO mengubah a.txt
+  g('switch', '-q', 'main'); commit('b.txt', 'b1');                          // orang lain mengubah b.txt
+  g('update-ref', 'refs/remotes/origin/main', 'main');
+  assert.deepStrictEqual(mergeClash(tmp, 'wo/x', 'main'), [], 'file berbeda: tidak bentrok');
+  commit('a.txt', 'a2');                                                     // orang lain juga mengubah a.txt
+  g('update-ref', 'refs/remotes/origin/main', 'main');
+  assert.deepStrictEqual(mergeClash(tmp, 'wo/x', 'main'), ['a.txt'], 'file sama: bentrok');
+  assert.ok(base0);
+  fs.rmSync(tmp, { recursive: true });
   return sw.then(() => selftestServer(assert, ui)).then(() => console.log('selftest OK'));
 }
 

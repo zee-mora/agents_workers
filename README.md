@@ -78,6 +78,7 @@ Setelah admin menekan **Approve & merge** di `/orders`, VPS membuat job merge da
 
 - `target` **hanya** dibaca dari `projects.json` laptop. Tanpa `target` project itu tidak bisa di-merge (VPS tidak bisa memaksa). Disarankan `development`, bukan `main`.
 - Syarat: working tree bersih, branch WO masih di commit yang direview (`head_sha`), dan `target` lokal bisa fast-forward ke `origin/<target>`.
+- Tumpang tindih: jika ada file yang diubah WO **dan** juga diubah di `origin/<target>` sejak WO dibuat (mis. orang lain mengerjakan hal yang sama), merge ditolak dengan `MERGE_FAILED` yang menyebut nama filenya. Buat WO baru dari `<target>` terbaru atau merge manual. Aturan ini lebih ketat dari konflik Git (file yang sama tapi baris berbeda juga ditolak).
 - Konflik: `git merge --abort`. Push gagal: target lokal di-reset ke posisi semula. Hasilnya dilaporkan sebagai `MERGE_FAILED` beserta pesannya.
 - Claude tidak terlibat dan tidak punya hak push. Yang push hanya kode `processMerge` di `worker.js`, memakai kredensial git di laptop (`GIT_TERMINAL_PROMPT=0`, jadi tidak pernah menunggu input).
 - Selama merge, worker berpindah branch di repo laptop lalu kembali ke branch semula. Jangan mengedit repo yang sama saat itu (tree kotor = ditolak).
