@@ -11,7 +11,7 @@ Sisi server ada di repo `vps-monitor` (`orchestrator.js`, `docs/orchestrator.md`
 2. `project_key` diubah jadi path lewat `projects.json`. Tidak ada di daftar: ditolak.
 3. Tolak jika `git status` kotor. Buat branch `wo/<id>-<attempt>` dari HEAD.
 4. Jalankan `claude -p` lewat `spawn` (tanpa shell) dengan batas budget dan timeout.
-5. Baca hasil JSON. Token dari `modelUsage`, biaya dari `total_cost_usd`.
+5. Baca event `result` dari stream (`--output-format stream-json --verbose`). Token dari `modelUsage`, biaya dari `total_cost_usd`.
 6. Bukti, berhenti di yang pertama gagal:
    - `is_error` false. `error_max_budget_usd` jadi `OVER_BUDGET`, error lain `FAILED`.
    - Jawaban memuat `BLOCKED:` jadi `NEEDS_REVIEW`.
@@ -63,6 +63,15 @@ Laptop Linux agar tetap jalan saat lid ditutup: `HandleLidSwitch=ignore` di `/et
 
 Worker mengirim daftar project (hanya **key dan target**, tanpa path) ke VPS saat start, saat `projects.json` berubah, dan tiap 10 menit. UI memakainya untuk dropdown "Project" di form WO, dan VPS menolak WO ke project yang tidak terdaftar. Worker harus pernah jalan agar WO bisa dibuat.
 
+## UI live (localhost)
+
+Worker membuka `http://127.0.0.1:8787` (ganti dengan `STATUS_PORT` di `.env`). Isinya: status (menunggu / mengerjakan WO / merge / jeda / berhenti), WO dan project aktif, sisa waktu dan budget, serta aktivitas agent yang bergerak live (file yang dibaca/diubah, perintah yang dijalankan). Port dipakai proses lain: worker tetap jalan tanpa UI.
+
+- Tombol **Stop** bersifat graceful: WO atau merge yang sedang berjalan diselesaikan dan dilaporkan, lalu worker berhenti mengambil job. Long-poll yang menunggu dibatalkan; jeda kuota juga dihentikan. Tombol **Start** melanjutkan segera. Tidak ada tombol kill (membuang pekerjaan parsial); darurat: `pm2 stop laptop-runner`.
+- Worker selalu aktif saat (re)start. Status berhenti tidak disimpan.
+- Hanya bind `127.0.0.1`. `POST /start` dan `/stop` wajib header `X-Worker-UI: 1` dan `Host` localhost (menahan CSRF dari situs lain dan DNS rebinding). Token dan path absolut repo tidak tampil.
+- Riwayat aktivitas hanya di memori (±500 baris terakhir), hilang saat restart.
+
 ## Approve dan merge
 
 Setelah admin menekan **Approve & merge** di `/orders`, VPS membuat job merge dan worker mengambilnya (`kind: "merge"`). Worker me-merge branch `wo/<id>` ke branch `target` project itu, lalu `git push origin <target>`.
@@ -105,5 +114,6 @@ Belum teruji: `claude -p` asli lewat worker, Playwright, login Claude yang aktif
 
 ## Berkas
 
-- `worker.js`: seluruh worker, plus `--selftest`.
+- `worker.js`: worker, plus `--selftest`.
+- `ui.js`: state, ringkasan event stream, dan server UI live.
 - `projects.json.example`, `.env.example`.

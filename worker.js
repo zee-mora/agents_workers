@@ -28,6 +28,10 @@ const RULES = [
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const tail = (s, n = 2000) => String(s || '').slice(-n);
 const git = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' }).trim();
+// Tidur yang bisa dibangunkan (tombol Start/Stop UI).
+let wake = null;
+const sleepWake = (ms) => new Promise((r) => { const t = setTimeout(done, ms); function done() { clearTimeout(t); wake = null; r(); } wake = done; });
+const wakeUp = () => wake && wake();
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------- fungsi murni (dites di --selftest) ----------
@@ -85,12 +89,12 @@ function buildPrompt(wo) {
 
 // ---------- VPS API ----------
 
-async function api(method, p, body, timeoutMs = 15000) {
+async function api(method, p, body, timeoutMs = 15000, signal) {
   const res = await fetch(VPS_URL + p, {
     method,
     headers: { Authorization: `Bearer ${TOKEN}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]),
   });
   if (!res.ok) throw new Error(`${method} ${p} -> ${res.status}`);
   return res.json();
@@ -300,20 +304,26 @@ async function main() {
   if (!TOKEN) { console.error('WORKER_TOKEN kosong (isi .env)'); process.exit(1); }
   log(`worker aktif -> ${VPS_URL}`);
   const port = Number(process.env.STATUS_PORT || 8787);
-  if (await ui.startUI({ port, onStart() {}, onStop() {} })) log(`UI: http://127.0.0.1:${port}`);
+  let pollAbort = null;
+  // Stop: batalkan long-poll dan bangunkan jeda kuota supaya loop sampai ke gerbang. Job berjalan tidak diinterupsi.
+  const onStop = () => { pollAbort?.abort(); wakeUp(); };
+  if (await ui.startUI({ port, onStart: wakeUp, onStop })) log(`UI: http://127.0.0.1:${port}`);
   for (;;) {
+    if (!ui.state.enabled) { log('worker dihentikan dari UI'); while (!ui.state.enabled) await sleepWake(60000); log('worker dilanjutkan dari UI'); }
     await registerProjects();
     try {
-      const { wo, kind } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}`, null, (POLL_WAIT + 10) * 1000);
+      pollAbort = new AbortController();
+      const { wo, kind } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}`, null, (POLL_WAIT + 10) * 1000, pollAbort.signal);
       if (!wo) { await sleep(2000); continue; }
       if (kind === 'merge' || wo.status === 'MERGING') { await processMerge(wo); continue; } // jangan pernah menjalankan agent untuk job merge
       if (await processWO(wo)) {
         log('kuota/login bermasalah, jeda 10 menit');
         ui.setPhase('paused', { paused_until: Date.now() + PAUSE_MS });
-        await sleep(PAUSE_MS);
+        await sleepWake(PAUSE_MS);
         ui.setPhase('idle', { paused_until: null });
       }
     } catch (e) {
+      if (pollAbort?.signal.aborted) continue; // Stop dari UI, bukan error
       log('polling error:', e.message);
       await sleep(5000);
     }
@@ -370,7 +380,10 @@ function selftest() {
   const lr = makeLineReader((l) => got.push(l));
   lr.write('{"a":1}\n{"b"'); lr.write(':2}\n'); lr.write('tanpa newline'); lr.flush();
   assert.deepStrictEqual(got, ['{"a":1}', '{"b":2}', 'tanpa newline']);
-  return selftestServer(assert, ui).then(() => console.log('selftest OK'));
+  const t0 = Date.now();
+  setTimeout(wakeUp, 10);
+  const sw = sleepWake(60000).then(() => assert.ok(Date.now() - t0 < 1000, 'sleepWake harus selesai lebih awal'));
+  return sw.then(() => selftestServer(assert, ui)).then(() => console.log('selftest OK'));
 }
 
 async function selftestServer(assert, ui) {
