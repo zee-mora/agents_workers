@@ -5,6 +5,7 @@ const { spawn, execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const ui = require('./ui');
 
 try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* .env opsional */ }
 
@@ -54,6 +55,15 @@ function parseResult(out) {
   };
 }
 
+// Sambung chunk stdout jadi baris utuh (satu baris JSON bisa terpotong di tengah chunk).
+function makeLineReader(onLine) {
+  let buf = '';
+  return {
+    write(chunk) { buf += chunk; const parts = buf.split('\n'); buf = parts.pop(); parts.forEach(onLine); },
+    flush() { if (buf) onLine(buf); buf = ''; },
+  };
+}
+
 function classify(r) {
   if (!r.is_error) return null;
   return r.subtype === 'error_max_budget_usd' ? 'OVER_BUDGET' : 'FAILED';
@@ -94,7 +104,7 @@ function runClaude(cwd, prompt, wo) {
   const timeout = Math.min(Number(lim.timeout_sec) || 600, MAX_TIMEOUT) * 1000;
   const model = MODELS.includes(lim.model) ? lim.model : 'sonnet';
   // prompt harus sebelum --allowedTools (variadic). Tanpa shell: tidak ada injection.
-  const args = ['-p', prompt, '--output-format', 'json', '--model', model,
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--model', model,
     '--max-budget-usd', String(budget), '--permission-mode', 'acceptEdits',
     '--append-system-prompt', RULES, '--allowedTools', ALLOWED_TOOLS];
   const env = { ...process.env };
@@ -102,12 +112,21 @@ function runClaude(cwd, prompt, wo) {
 
   return new Promise((resolve) => {
     const p = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', timedOut = false;
-    p.stdout.on('data', (d) => { stdout += d; });
+    let raw = '', resultLine = '', stderr = '', timedOut = false;
+    ui.setPhase('wo', { started_at: Date.now(), timeout_ms: timeout, budget_usd: budget });
+    const lines = makeLineReader((l) => {
+      try {
+        const ev = JSON.parse(l);
+        if (ev.type === 'result') resultLine = l;
+        ui.summarize(ev, cwd).forEach(ui.push);
+      } catch { /* baris bukan JSON: abaikan */ }
+    });
+    p.stdout.on('data', (d) => { raw = (raw + d).slice(-2000); lines.write(String(d)); });
     p.stderr.on('data', (d) => { stderr += d; });
+    const stdout = () => { lines.flush(); return resultLine || raw; }; // hanya baris result, bukan seluruh stream
     const t = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, timeout);
-    p.on('error', (e) => { clearTimeout(t); resolve({ stdout, stderr: String(e), code: -1, timedOut }); });
-    p.on('close', (code) => { clearTimeout(t); resolve({ stdout, stderr, code, timedOut }); });
+    p.on('error', (e) => { clearTimeout(t); resolve({ stdout: stdout(), stderr: String(e), code: -1, timedOut }); });
+    p.on('close', (code) => { clearTimeout(t); resolve({ stdout: stdout(), stderr, code, timedOut }); });
   });
 }
 
@@ -141,6 +160,7 @@ async function report(wo, result, shotPath) {
 // Return true jika kuota/login bermasalah (loop akan jeda).
 async function processWO(wo) {
   log(`WO ${wo.id} diterima`);
+  ui.setPhase('wo', { wo_id: wo.id, project_key: wo.project_key, started_at: Date.now(), timeout_ms: null, budget_usd: null });
   const result = { status: 'FAILED', exit_code: null, turns: null, tokens: null, cost_usd: null,
     diff_stat: null, verify_passed: null, branch: null, logs: '' };
   const hb = setInterval(() => api('POST', `/api/wo/${wo.id}/heartbeat`, {}).catch(() => {}), 30000);
@@ -203,6 +223,7 @@ async function processWO(wo) {
     return quota;
   } finally {
     clearInterval(hb);
+    ui.setPhase('idle', { wo_id: null, project_key: null });
     try { if (dir && base) { const cur = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD'); if (cur.startsWith('wo/')) git(dir, 'checkout', '-f', '-'); } } catch { /* biarkan */ }
     try { await report(wo, result, shot); log(`WO ${wo.id} -> ${result.status} ($${result.cost_usd})`); }
     catch (e) { log(`gagal lapor WO ${wo.id}: ${e.message} (lease akan habis)`); }
@@ -216,6 +237,7 @@ const gitNet = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { encoding:
 // ("target"); VPS tidak bisa memilih. Agent (claude) tidak terlibat dan tidak punya hak push.
 async function processMerge(wo) {
   log(`MERGE ${wo.id} diterima`);
+  ui.setPhase('merge', { wo_id: wo.id, project_key: wo.project_key, started_at: Date.now(), timeout_ms: null, budget_usd: null });
   const out = { status: 'MERGE_FAILED', detail: '', sha: null, target: null };
   const hb = setInterval(() => api('POST', `/api/wo/${wo.id}/heartbeat`, {}).catch(() => {}), 30000);
   let dir, origBranch, targetPrev;
@@ -249,6 +271,7 @@ async function processMerge(wo) {
     try { if (dir && targetPrev && git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') === out.target) git(dir, 'reset', '--hard', targetPrev); } catch { /* biarkan */ }
   } finally {
     clearInterval(hb);
+    ui.setPhase('idle', { wo_id: null, project_key: null });
     try { if (dir && origBranch && git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') !== origBranch) git(dir, 'switch', origBranch); } catch { /* biarkan */ }
     try { await api('POST', `/api/wo/${wo.id}/merge-result`, out, 30000); log(`MERGE ${wo.id} -> ${out.status}: ${out.detail}`); }
     catch (e) { log(`gagal lapor merge ${wo.id}: ${e.message} (lease akan habis)`); }
@@ -276,13 +299,20 @@ async function registerProjects() {
 async function main() {
   if (!TOKEN) { console.error('WORKER_TOKEN kosong (isi .env)'); process.exit(1); }
   log(`worker aktif -> ${VPS_URL}`);
+  const port = Number(process.env.STATUS_PORT || 8787);
+  if (await ui.startUI({ port, onStart() {}, onStop() {} })) log(`UI: http://127.0.0.1:${port}`);
   for (;;) {
     await registerProjects();
     try {
       const { wo, kind } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}`, null, (POLL_WAIT + 10) * 1000);
       if (!wo) { await sleep(2000); continue; }
       if (kind === 'merge' || wo.status === 'MERGING') { await processMerge(wo); continue; } // jangan pernah menjalankan agent untuk job merge
-      if (await processWO(wo)) { log('kuota/login bermasalah, jeda 10 menit'); await sleep(PAUSE_MS); }
+      if (await processWO(wo)) {
+        log('kuota/login bermasalah, jeda 10 menit');
+        ui.setPhase('paused', { paused_until: Date.now() + PAUSE_MS });
+        await sleep(PAUSE_MS);
+        ui.setPhase('idle', { paused_until: null });
+      }
     } catch (e) {
       log('polling error:', e.message);
       await sleep(5000);
@@ -336,6 +366,10 @@ function selftest() {
   assert.ok(!ui.csrfOk(rq('POST', { host: '127.0.0.1:8787' }), 8787));
   assert.ok(!ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: 'evil.com' }), 8787));
   assert.ok(!ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: '127.0.0.1:9999' }), 8787));
+  const got = [];
+  const lr = makeLineReader((l) => got.push(l));
+  lr.write('{"a":1}\n{"b"'); lr.write(':2}\n'); lr.write('tanpa newline'); lr.flush();
+  assert.deepStrictEqual(got, ['{"a":1}', '{"b":2}', 'tanpa newline']);
   return selftestServer(assert, ui).then(() => console.log('selftest OK'));
 }
 
