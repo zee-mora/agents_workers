@@ -227,10 +227,10 @@ async function processWO(wo) {
     return quota;
   } finally {
     clearInterval(hb);
-    ui.setPhase('idle', { wo_id: null, project_key: null });
     try { if (dir && base) { const cur = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD'); if (cur.startsWith('wo/')) git(dir, 'checkout', '-f', '-'); } } catch { /* biarkan */ }
     try { await report(wo, result, shot); log(`WO ${wo.id} -> ${result.status} ($${result.cost_usd})`); }
     catch (e) { log(`gagal lapor WO ${wo.id}: ${e.message} (lease akan habis)`); }
+    ui.setPhase('idle', { wo_id: null, project_key: null }); // idle hanya setelah laporan terkirim (Stop menunggu ini)
     if (shot) fs.rm(shot, () => {});
   }
 }
@@ -275,10 +275,10 @@ async function processMerge(wo) {
     try { if (dir && targetPrev && git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') === out.target) git(dir, 'reset', '--hard', targetPrev); } catch { /* biarkan */ }
   } finally {
     clearInterval(hb);
-    ui.setPhase('idle', { wo_id: null, project_key: null });
     try { if (dir && origBranch && git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') !== origBranch) git(dir, 'switch', origBranch); } catch { /* biarkan */ }
     try { await api('POST', `/api/wo/${wo.id}/merge-result`, out, 30000); log(`MERGE ${wo.id} -> ${out.status}: ${out.detail}`); }
     catch (e) { log(`gagal lapor merge ${wo.id}: ${e.message} (lease akan habis)`); }
+    ui.setPhase('idle', { wo_id: null, project_key: null });
   }
 }
 
@@ -418,6 +418,7 @@ async function selftestServer(assert, ui) {
   assert.ok(js.status === 200 && js.type.startsWith('text/javascript'));
   assert.ok(font.status === 200 && font.type === 'font/woff2');
   for (const bad of ['/fonts/../ui.js', '/..%2fworker.js', '/.env', '/fonts/OFL.txt', '/projects.json']) assert.strictEqual((await call(port, 'GET', bad)).status, 404, bad);
+  for (const p of ['/events', '/', '/app.js']) assert.strictEqual((await call(port, 'GET', p, { host: 'evil.com' })).status, 403, 'GET dengan Host asing: ' + p);
   assert.ok((await call(port, 'GET', '/events')).body.startsWith('event: state'));
   assert.strictEqual(await ui.startUI({ port, onStart() {}, onStop() {} }), null); // port dipakai: UI nonaktif, tidak melempar
   srv.closeAllConnections(); srv.close();

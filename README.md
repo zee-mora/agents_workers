@@ -69,7 +69,7 @@ Worker membuka `http://127.0.0.1:8787` (ganti dengan `STATUS_PORT` di `.env`). I
 
 - Tombol **Stop** bersifat graceful: WO atau merge yang sedang berjalan diselesaikan dan dilaporkan, lalu worker berhenti mengambil job. Long-poll yang menunggu dibatalkan; jeda kuota juga dihentikan. Tombol **Start** melanjutkan segera. Tidak ada tombol kill (membuang pekerjaan parsial); darurat: `pm2 stop laptop-runner`.
 - Worker selalu aktif saat (re)start. Status berhenti tidak disimpan.
-- Hanya bind `127.0.0.1`. `POST /start` dan `/stop` wajib header `X-Worker-UI: 1` dan `Host` localhost (menahan CSRF dari situs lain dan DNS rebinding). Token dan path absolut repo tidak tampil.
+- Hanya bind `127.0.0.1`. `POST /start` dan `/stop` wajib header `X-Worker-UI: 1` dan `Host` localhost (menahan CSRF dari situs lain). Header `Host` juga dicek di semua rute GET, supaya situs lain tidak bisa membaca stream aktivitas lewat DNS rebinding. Token dan path absolut repo tidak tampil.
 - Riwayat aktivitas hanya di memori (±500 baris terakhir), hilang saat restart.
 
 ## Approve dan merge
@@ -116,4 +116,5 @@ Belum teruji: `claude -p` asli lewat worker, Playwright, login Claude yang aktif
 
 - `worker.js`: worker, plus `--selftest`.
 - `ui.js`: state, ringkasan event stream, dan server UI live.
+- `public/`: halaman UI (`index.html`, `app.css`, `app.js`) dan font Geist lokal (lisensi OFL di `public/fonts/OFL.txt`). Hanya berkas di daftar putih `FILES` di `ui.js` yang disajikan.
 - `projects.json.example`, `.env.example`.

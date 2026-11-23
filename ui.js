@@ -54,10 +54,8 @@ function setPhase(phase, info = {}) {
 }
 
 // Host harus localhost (tahan DNS rebinding), header kustom memicu preflight CORS (tahan CSRF).
-function csrfOk(req, port) {
-  const h = req.headers || {};
-  return h['x-worker-ui'] === '1' && [`127.0.0.1:${port}`, `localhost:${port}`].includes(h.host);
-}
+const hostOk = (req, port) => [`127.0.0.1:${port}`, `localhost:${port}`].includes((req.headers || {}).host);
+const csrfOk = (req, port) => (req.headers || {})['x-worker-ui'] === '1' && hostOk(req, port);
 
 
 const PUBLIC = path.join(__dirname, 'public');
@@ -71,6 +69,7 @@ const FILES = {
 };
 
 function handle(req, res, ctl, port) {
+  if (!hostOk(req, port)) { res.writeHead(403).end(); return; } // semua rute: tahan DNS rebinding (stream aktivitas tidak boleh terbaca situs lain)
   const url = req.url.split('?')[0];
   if (req.method === 'POST' && (url === '/start' || url === '/stop')) {
     if (!csrfOk(req, port)) { res.writeHead(403).end(); return; }
