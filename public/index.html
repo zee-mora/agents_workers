@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Worker</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <span class="brand">Agent Worker</span>
+    <div class="controls" role="group" aria-label="Kontrol worker">
+      <button id="start" type="button">Start</button>
+      <button id="stop" type="button">Stop</button>
+    </div>
+  </header>
+
+  <section class="now" aria-live="polite">
+    <p class="status"><span class="dot" id="dot"></span><span id="status">Menyambung…</span></p>
+    <h1 id="doing">&nbsp;</h1>
+    <p class="meta" id="meta"></p>
+    <div class="bar" id="bar" hidden><i id="barfill"></i></div>
+  </section>
+
+  <section class="transcript" aria-label="Aktivitas agent">
+    <ol id="log"></ol>
+    <p class="empty" id="empty">Belum ada aktivitas. Aktivitas muncul saat worker mengerjakan WO.</p>
+  </section>
+</main>
+</body>
+</html>

@@ -396,6 +396,7 @@ async function selftestServer(assert, ui) {
     });
     r.on('error', reject); r.end();
   });
+  const http2 = (port, p) => new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port, path: p }, (s) => { s.resume(); resolve({ status: s.statusCode, type: s.headers['content-type'] || '' }); }).on('error', reject));
   let stops = 0, starts = 0;
   const srv = await ui.startUI({ port: 0, onStart() { starts++; }, onStop() { stops++; } });
   const port = srv.address().port;
@@ -411,6 +412,12 @@ async function selftestServer(assert, ui) {
   assert.strictEqual((await call(port, 'PUT', '/')).status, 405);
   const page = await call(port, 'GET', '/');
   assert.ok(page.status === 200 && page.body.includes('Start') && page.body.includes('Stop'));
+  assert.ok(page.body.includes('app.css') && page.body.includes('app.js'));
+  const css = await http2(port, '/app.css'), js = await http2(port, '/app.js'), font = await http2(port, '/fonts/geist.woff2');
+  assert.ok(css.status === 200 && css.type.startsWith('text/css'));
+  assert.ok(js.status === 200 && js.type.startsWith('text/javascript'));
+  assert.ok(font.status === 200 && font.type === 'font/woff2');
+  for (const bad of ['/fonts/../ui.js', '/..%2fworker.js', '/.env', '/fonts/OFL.txt', '/projects.json']) assert.strictEqual((await call(port, 'GET', bad)).status, 404, bad);
   assert.ok((await call(port, 'GET', '/events')).body.startsWith('event: state'));
   assert.strictEqual(await ui.startUI({ port, onStart() {}, onStop() {} }), null); // port dipakai: UI nonaktif, tidak melempar
   srv.closeAllConnections(); srv.close();
