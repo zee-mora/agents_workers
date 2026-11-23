@@ -53,6 +53,10 @@ POLL_WAIT=25
 ```
 `db_sync` (opsional): `{ "cmd": "<perintah bash>", "ttl_hours": 6 }`. Sebelum agent jalan, jika sinkron terakhir lebih tua dari `ttl_hours`, worker menjalankan `cmd` (cwd = folder project, tanpa `WORKER_TOKEN`). Gagal = WO `FAILED`, agent tidak jalan. Kredensial DB taruh di script/`~/.my.cnf` laptop, bukan di repo. Contoh: `ssh USER@HOST "mysqldump --single-transaction --quick --no-tablespaces DB | gzip" | gunzip | mysql DB_LOKAL`. Gunakan DB lokal khusus worker karena isinya ditimpa. Siap pakai: `scripts/sync-db.sh <db-di-server> <db-lokal>` menarik `GET /api/wo/db-dump` dari VPS (hanya DB di `ORCH_DUMP_DBS` di env server) dan merestore dengan `SYNC_MYSQL_USER`/`SYNC_MYSQL_PASSWORD` dari `.env` worker; `--dump-only` untuk tes tanpa restore. Contoh `cmd`: `./scripts/sync-db.sh oso_marketing_db oso_new`.
 
+Sumber DB per WO: tambahkan `"sources": ["db_a", "db_b"]` dan `"default": "db_a"` di `db_sync`. UI VPS menampilkan dropdown "Sumber DB" untuk project itu, dan worker menjalankan `cmd` dengan env `DB_SOURCE=<pilihan>` (pakai `"$DB_SOURCE"` di `cmd`). Pilihan di luar `sources` ditolak (WO `FAILED`). Setiap DB harus ada di `ORCH_DUMP_DBS` server. Contoh: `./scripts/sync-db.sh "$DB_SOURCE" hrpresenttracker_12`.
+
+Screenshot: isi `url` (origin dev server, mis. `http://localhost:8000`). Agent diminta menutup jawaban dengan `PAGE: /path`; worker memotret `url`+path itu (tanpa PAGE: halaman `url`) saat repo masih di branch WO, lalu mengirimnya ke VPS. Halaman di balik login: isi `"storage_state": "/path/state.json"` (hasil `context.storageState()` Playwright). Login otomatis (lebih awet dari `storage_state`, yang kedaluwarsa): `"login": { "user": "email@dev", "password": "..." }` (opsional `path` default `/login`, `user_selector`, `password_selector`). Worker login di browser kosong tiap foto. `login.setup` (opsional): perintah bash yang dijalankan di folder project sebelum login untuk memastikan akunnya ada (harus idempotent, mis. `php artisan db:seed --class=DeveloperSeeder --force`). Ditolak jika `DB_HOST` di `.env` project bukan `127.0.0.1`/`localhost`. Pakai akun dev berhak rendah; kredensial hanya di `projects.json` laptop (di-gitignore), tidak dikirim ke VPS dan tidak masuk prompt agent. Tidak mendukung captcha/2FA. Dev server dinyalakan worker hanya selama foto, lalu dimatikan: default `php artisan serve --host=localhost --port=<port dari url>` jika ada `artisan`, atau perintah `"serve"` di `projects.json` (cwd = folder project, tanpa `WORKER_TOKEN`). Port yang sudah terbuka dipakai apa adanya dan tidak dimatikan.
+
 `verify`, `url`, dan `target` opsional. `verify` hanya dari file ini, tidak pernah dari WO.
 
 Permanen dengan PM2:
@@ -88,7 +92,7 @@ Setelah admin menekan **Approve & merge** di `/orders`, VPS membuat job merge da
 ## Batas dan keamanan (jangan dilonggarkan tanpa alasan)
 
 - Worker tidak mempercayai VPS: budget maksimum $1, timeout maksimum 1800 detik, model hanya `haiku|sonnet|opus`.
-- `claude` dijalankan dengan `--allowedTools "Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*)"`. Jangan beri `Bash` bebas.
+- `claude` dijalankan dengan `--allowedTools "Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*),Bash(python3:*)"`. Jangan beri `Bash` bebas. `python3` diizinkan agar agent bisa edit besar lewat skrip; ia tidak dibatasi sandbox, jadi hanya pakai di laptop dev.
 - `WORKER_TOKEN` dihapus dari environment proses `claude`.
 - URL screenshot hanya `localhost` dan `127.0.0.1`.
 - Tidak pernah commit ke branch utama. Rollback = hapus branch `wo/*`.

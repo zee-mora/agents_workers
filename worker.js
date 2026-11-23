@@ -16,7 +16,7 @@ const PAUSE_MS = 10 * 60 * 1000;     // jeda saat kuota/login bermasalah
 const MAX_BUDGET = 1.0;              // batas keras sisi worker, tidak percaya nilai dari VPS
 const MAX_TIMEOUT = 1800;
 const MODELS = ['haiku', 'sonnet', 'opus'];
-const ALLOWED_TOOLS = 'Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*)';
+const ALLOWED_TOOLS = 'Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*),Bash(python3:*)';
 const RULES = [
   '- Hanya kerjakan goals yang tertulis. Jangan refactor di luar itu.',
   '- Mulai dari file yang disarankan. Baca file sebelum mengubahnya; jangan menebak isinya.',
@@ -85,7 +85,15 @@ function buildPrompt(wo, imgPaths = []) {
   const goals = (wo.goals || []).length ? `\n\nGoals:\n${wo.goals.map((g, i) => `${i + 1}. ${g}`).join('\n')}` : '';
   const hint = (wo.files_hint || []).length ? `\n\nFile untuk dimulai:\n${wo.files_hint.join('\n')}` : '';
   const imgs = imgPaths.length ? `\n\nAttached images (read them with the Read tool):\n${imgPaths.join('\n')}` : '';
-  return `Context: ${wo.context}${goals}${hint}${imgs}`;
+  const page = '\n\nJika perubahan terlihat di halaman web, akhiri jawaban dengan satu baris `PAGE: /path/halaman` (path saja, untuk screenshot).';
+  return `Context: ${wo.context}${goals}${hint}${imgs}${page}`;
+}
+
+// Halaman yang disebut agent -> URL penuh di origin project. Hanya path; host selalu dari projects.json.
+function pageUrl(base, text) {
+  const m = /^PAGE:\s*(\/[^\s`]*)/m.exec(text || '');
+  if (!m || m[1].startsWith('//')) return base;
+  try { return new URL(m[1], base).href; } catch { return base; }
 }
 
 // ---------- VPS API ----------
@@ -107,11 +115,20 @@ const SYNC_DIR = path.join(__dirname, '.sync');
 function syncAge(key, now = Date.now()) {
   try { return now - fs.statSync(path.join(SYNC_DIR, key)).mtimeMs; } catch { return Infinity; }
 }
-async function syncDb(key, proj, now = Date.now()) {
+// dbSource (dari WO) harus ada di db_sync.sources milik laptop; dikirim ke cmd lewat env DB_SOURCE, tidak pernah disisipkan ke string.
+async function syncDb(key, proj, now = Date.now(), dbSource = null) {
   const c = proj.db_sync;
-  if (!c || !c.cmd || syncAge(key, now) < (Number(c.ttl_hours) || 6) * 3600 * 1000) return false;
-  log(`sync DB ${key}…`);
-  const env = { ...process.env, VPS_URL }; // script sync (milik laptop, dipercaya) butuh WORKER_TOKEN untuk db-dump
+  if (!c || !c.cmd) return false;
+  const sources = Array.isArray(c.sources) ? c.sources : [];
+  let src = null;
+  if (sources.length) {
+    src = dbSource || c.default || sources[0];
+    if (!sources.includes(src)) throw new Error(`sumber DB "${src}" tidak ada di db_sync.sources project ini`);
+  }
+  const stamp = src ? `${key}__${src}` : key; // ganti sumber = restore ulang walau TTL belum habis
+  if (syncAge(stamp, now) < Number(c.ttl_hours ?? 6) * 3600 * 1000) return false;
+  log(`sync DB ${key}${src ? ' dari ' + src : ''}…`);
+  const env = { ...process.env, VPS_URL, ...(src ? { DB_SOURCE: src } : {}) }; // script sync (milik laptop, dipercaya) butuh WORKER_TOKEN untuk db-dump
   const out = await new Promise((resolve) => {
     const p = spawn('bash', ['-c', c.cmd], { cwd: proj.path, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let buf = '';
@@ -123,7 +140,7 @@ async function syncDb(key, proj, now = Date.now()) {
   });
   if (out.code !== 0) throw new Error(`sync DB gagal (exit ${out.code}): ${tail(out.buf, 500)}`);
   fs.mkdirSync(SYNC_DIR, { recursive: true });
-  fs.writeFileSync(path.join(SYNC_DIR, key), String(now));
+  fs.writeFileSync(path.join(SYNC_DIR, stamp), String(now));
   return true;
 }
 
@@ -182,15 +199,68 @@ function runClaude(cwd, prompt, wo, addDir) {
   });
 }
 
-async function screenshot(url, viewport, out) {
+// Nyalakan dev server project hanya selama foto. Port sudah terbuka (server manual) = dipakai apa adanya, tidak dimatikan.
+// Default: `php artisan serve` jika ada file artisan; `serve` di projects.json menimpa. Token worker tidak diteruskan.
+async function withServer(proj, url, fn) {
+  const portOpen = () => fetch(url, { signal: AbortSignal.timeout(2000) }).then(() => true, () => false);
+  const port = new URL(url).port;
+  const cmd = proj.serve || (port && fs.existsSync(path.join(proj.path, 'artisan')) ? `php artisan serve --host=localhost --port=${port}` : null);
+  if (!cmd || await portOpen()) return fn();
+  const { WORKER_TOKEN, ...env } = process.env;
+  const p = spawn('bash', ['-c', cmd], { cwd: proj.path, env, stdio: 'ignore', detached: true });
+  try {
+    for (let i = 0; i < 30 && !(await portOpen()); i++) await new Promise((r) => setTimeout(r, 500));
+    return await fn();
+  } finally { try { process.kill(-p.pid); } catch { /* sudah mati */ } } // grup proses: bash + php + worker php
+}
+
+// login.setup (mis. seeder yang membuat akun dev, idempotent) hanya jalan jika DB_HOST di .env project lokal: jangan pernah menulis ke DB remote.
+function runSetup(proj) {
+  const envFile = path.join(proj.path, '.env');
+  const host = (fs.existsSync(envFile) ? /^DB_HOST=(.*)$/m.exec(fs.readFileSync(envFile, 'utf8')) : null)?.[1]?.trim().replace(/^["']|["']$/g, '');
+  if (!['127.0.0.1', 'localhost', '::1'].includes(host)) return `setup login ditolak: DB_HOST project "${host}" bukan lokal`;
+  const { WORKER_TOKEN, ...env } = process.env;
+  const r = spawnSync('bash', ['-c', proj.login.setup], { cwd: proj.path, env, encoding: 'utf8', timeout: 120000 });
+  return r.status === 0 ? null : `setup login gagal (exit ${r.status}): ${tail((r.stdout || '') + (r.stderr || ''), 500)}`;
+}
+
+const DEVICES = [{ name: 'Desktop', width: 1280, height: 800 }, { name: 'Tablet', width: 768, height: 1024 }, { name: 'HP', width: 390, height: 844 }];
+
+async function screenshot(url, viewport, out, storageState, login, proj) {
   if (!localUrlOk(url)) return 'URL ditolak (hanya localhost/127.0.0.1)';
   let browser;
   try {
     const { chromium } = require('playwright');
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: viewport?.width ? viewport : { width: 1280, height: 800 } });
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
-    await page.screenshot({ path: out, fullPage: true });
+    // storageState (opsional, dari projects.json): sesi login Playwright supaya halaman di balik login bisa difoto
+    const ctx = await browser.newContext({ viewport: viewport?.width ? viewport : { width: 1280, height: 800 },
+      ...(storageState && fs.existsSync(storageState) ? { storageState } : {}) });
+    const page = await ctx.newPage();
+    if (login && login.setup) { const e = runSetup(proj); if (e) return e; }
+    if (login && login.user && login.password) { // login otomatis tiap foto (kredensial hanya dari projects.json di laptop, tidak dikirim ke VPS)
+      await page.goto(new URL(login.path || '/login', url).href, { waitUntil: 'networkidle', timeout: 15000 });
+      await page.fill(login.user_selector || 'input[name="email"]', login.user);
+      await page.fill(login.password_selector || 'input[type="password"]', login.password);
+      await Promise.all([page.waitForLoadState('networkidle'), page.press(login.password_selector || 'input[type="password"]', 'Enter')]);
+      if (new URL(page.url()).pathname === new URL(login.path || '/login', url).pathname) return 'login gagal (kredensial salah / ada captcha atau 2FA)';
+    }
+    // viewport dari WO = satu foto; tanpa itu: desktop + tablet + HP digabung jadi satu PNG (server hanya menerima satu gambar)
+    const devs = viewport?.width ? [{ name: `${viewport.width}px`, ...viewport }] : DEVICES;
+    const shots = [];
+    for (const d of devs) {
+      await page.setViewportSize({ width: d.width, height: d.height || 800 });
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
+      await page.waitForTimeout(3000); // animasi masuk halaman (konten baru muncul ±3 dtk)
+      shots.push({ name: d.name, w: d.width, h: d.height || 800, b64: (await page.screenshot()).toString('base64') }); // bukan fullPage: fullPage memicu ulang animasi masuk (konten kosong)
+    }
+    if (shots.length === 1) { fs.writeFileSync(out, Buffer.from(shots[0].b64, 'base64')); return null; }
+    const H = 700; // semua foto diskalakan ke tinggi sama
+    const html = `<body style="margin:0;padding:16px;background:#e5e7eb;font:600 13px sans-serif;display:flex;gap:16px;align-items:flex-start;width:max-content">${shots.map((x) =>
+      `<div><div style="margin-bottom:6px;color:#374151">${x.name} (${x.w}×${x.h})</div><img style="display:block;height:${H}px;width:${Math.round(x.w * H / x.h)}px;border:1px solid #9ca3af;background:#fff" src="data:image/png;base64,${x.b64}"></div>`).join('')}</body>`;
+    const cp = await ctx.newPage();
+    await cp.setContent(html);
+    await cp.setViewportSize({ width: 100, height: 100 });
+    await cp.screenshot({ path: out, fullPage: true });
     return null;
   } catch (e) {
     return `screenshot gagal: ${e.message}`;
@@ -216,7 +286,7 @@ async function processWO(wo) {
   const result = { status: 'FAILED', exit_code: null, turns: null, tokens: null, cost_usd: null,
     diff_stat: null, verify_passed: null, branch: null, logs: '' };
   const hb = setInterval(() => api('POST', `/api/wo/${wo.id}/heartbeat`, {}).catch(() => {}), 30000);
-  let dir, base, shot, imgDir, quota = false;
+  let dir, base, shot, imgDir, pageText = '', quota = false;
 
   try {
     const proj = JSON.parse(fs.readFileSync(path.join(__dirname, 'projects.json'), 'utf8'))[wo.project_key];
@@ -225,7 +295,7 @@ async function processWO(wo) {
     if (!fs.existsSync(dir)) { result.logs = `folder tidak ada: ${dir}`; return false; }
     if (git(dir, 'status', '--porcelain')) { result.logs = 'working tree kotor, WO ditolak'; return false; }
 
-    try { await syncDb(wo.project_key, proj); }
+    try { await syncDb(wo.project_key, proj, Date.now(), wo.db_source); }
     catch (e) { result.logs = `WO tidak dijalankan: ${e.message}`; return false; } // jangan kerja di data basi tanpa sepengetahuan
 
     let imgPaths = [];
@@ -246,6 +316,7 @@ async function processWO(wo) {
     result.turns = r.turns; result.tokens = r.tokens; result.cost_usd = r.cost;
     result.logs = tail(r.text || r.errors.join('; '));
     quota = isQuota(r);
+    pageText = r.text;
 
     const bad = classify(r);
     if (bad) { result.status = bad; return quota; }
@@ -271,7 +342,7 @@ async function processWO(wo) {
     const url = wo.verification?.target_url || proj.url;
     if (url) {
       shot = path.join(os.tmpdir(), `${wo.id}.png`);
-      const err = await screenshot(url, wo.verification?.viewport, shot);
+      const err = await withServer(proj, url, () => screenshot(pageUrl(url, pageText), wo.verification?.viewport, shot, proj.storage_state, proj.login, proj));
       if (err) result.logs += `\n[${err}]`; // screenshot gagal tidak menggagalkan WO
     }
     result.status = 'COMPLETED';
@@ -359,7 +430,10 @@ async function registerProjects() {
     const m = fs.statSync(f).mtimeMs;
     if (m === regMtime && Date.now() - regAt < 600000) return;
     const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
-    const projects = Object.entries(cfg).map(([key, p]) => ({ key, target: (p && p.target) || null }));
+    const projects = Object.entries(cfg).map(([key, p]) => {
+      const s = p && p.db_sync && Array.isArray(p.db_sync.sources) ? p.db_sync.sources : [];
+      return { key, target: (p && p.target) || null, ...(s.length ? { db_sources: s, db_default: p.db_sync.default || s[0] } : {}) };
+    });
     await api('POST', '/api/wo/projects', { projects });
     regMtime = m; regAt = Date.now();
     log(`project terdaftar: ${projects.map((p) => p.key + (p.target ? '→' + p.target : '')).join(', ')}`);
@@ -424,6 +498,9 @@ function selftest() {
   assert.ok(ip.includes('Attached images (read them with the Read tool):\n/tmp/x/a.png'));
   assert.ok(!buildPrompt({ context: 'c', goals: ['a'] }).includes('Attached images'));
   assert.ok(!buildPrompt({ context: 'c', goals: [] }).includes('Goals'));
+  assert.strictEqual(pageUrl('http://localhost:8000', 'selesai\nPAGE: /attendance'), 'http://localhost:8000/attendance');
+  assert.strictEqual(pageUrl('http://localhost:8000', 'PAGE: //evil.com/x'), 'http://localhost:8000');
+  assert.strictEqual(pageUrl('http://localhost:8000', 'tanpa halaman'), 'http://localhost:8000');
   const ui = require('./ui');
   const tu = (name, input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
   assert.deepStrictEqual(ui.summarize(tu('Edit', { file_path: '/home/x/proj/app/Foo.php' }), '/home/x/proj'), ['Edit app/Foo.php']);
@@ -488,7 +565,13 @@ async function selftestSync(assert) {
     assert.strictEqual(await run('exit 9'), false); // masih segar: tidak dijalankan
     assert.strictEqual(await run('true', 1, Date.now() + 2 * 3600e3), true); // lewat ttl: jalan lagi
     assert.strictEqual(await syncDb(key, { path: '.' }), false); // tanpa db_sync: dilewati
-  } finally { fs.rmSync(f, { force: true }); }
+    // sources: pilih per WO, di luar daftar ditolak, ganti sumber = sync ulang, DB_SOURCE lewat env
+    const ms = (cmd) => ({ path: '.', db_sync: { cmd, ttl_hours: 6, sources: ['a_db', 'b_db'], default: 'a_db' } });
+    await assert.rejects(syncDb(key, ms('true'), Date.now(), 'x; rm -rf /'), /tidak ada di db_sync\.sources/);
+    assert.strictEqual(await syncDb(key, ms('[ "$DB_SOURCE" = a_db ]')), true); // default
+    assert.strictEqual(await syncDb(key, ms('exit 9'), Date.now(), 'a_db'), false); // a_db masih segar
+    assert.strictEqual(await syncDb(key, ms('[ "$DB_SOURCE" = b_db ]'), Date.now(), 'b_db'), true); // b_db belum
+  } finally { for (const x of [f, f + '__a_db', f + '__b_db']) fs.rmSync(x, { force: true }); }
 }
 
 async function selftestServer(assert, ui) {
