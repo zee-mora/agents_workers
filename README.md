@@ -51,13 +51,27 @@ POLL_WAIT=25
   }
 }
 ```
-`verify` dan `url` opsional. `verify` hanya dari file ini, tidak pernah dari WO.
+`verify`, `url`, dan `target` opsional. `verify` hanya dari file ini, tidak pernah dari WO.
 
 Permanen dengan PM2:
 ```bash
 pm2 start worker.js --name laptop-runner && pm2 save && pm2 startup
 ```
 Laptop Linux agar tetap jalan saat lid ditutup: `HandleLidSwitch=ignore` di `/etc/systemd/logind.conf`.
+
+## Daftar project di UI
+
+Worker mengirim daftar project (hanya **key dan target**, tanpa path) ke VPS saat start, saat `projects.json` berubah, dan tiap 10 menit. UI memakainya untuk dropdown "Project" di form WO, dan VPS menolak WO ke project yang tidak terdaftar. Worker harus pernah jalan agar WO bisa dibuat.
+
+## Approve dan merge
+
+Setelah admin menekan **Approve & merge** di `/orders`, VPS membuat job merge dan worker mengambilnya (`kind: "merge"`). Worker me-merge branch `wo/<id>` ke branch `target` project itu, lalu `git push origin <target>`.
+
+- `target` **hanya** dibaca dari `projects.json` laptop. Tanpa `target` project itu tidak bisa di-merge (VPS tidak bisa memaksa). Disarankan `development`, bukan `main`.
+- Syarat: working tree bersih, branch WO masih di commit yang direview (`head_sha`), dan `target` lokal bisa fast-forward ke `origin/<target>`.
+- Konflik: `git merge --abort`. Push gagal: target lokal di-reset ke posisi semula. Hasilnya dilaporkan sebagai `MERGE_FAILED` beserta pesannya.
+- Claude tidak terlibat dan tidak punya hak push. Yang push hanya kode `processMerge` di `worker.js`, memakai kredensial git di laptop (`GIT_TERMINAL_PROMPT=0`, jadi tidak pernah menunggu input).
+- Selama merge, worker berpindah branch di repo laptop lalu kembali ke branch semula. Jangan mengedit repo yang sama saat itu (tree kotor = ditolak).
 
 ## Batas dan keamanan (jangan dilonggarkan tanpa alasan)
 
@@ -86,7 +100,7 @@ Belum teruji: `claude -p` asli lewat worker, Playwright, login Claude yang aktif
 
 - Perubahan yang belum di-commit dibuang saat WO gagal atau kehabisan budget (hasil parsial tidak tersimpan).
 - Deteksi kuota habis memakai pencocokan teks (`limit|rate|overload|429|not logged in`); bisa meleset. Saat terdeteksi, worker jeda 10 menit.
-- Satu worker, satu WO pada satu waktu. Tidak ada retry otomatis di sisi worker.
+- Satu worker, satu job pada satu waktu (agent atau merge). Tidak ada retry otomatis di sisi worker.
 - Credential Claude punya masa berlaku. Login ulang sebelum habis, atau WO gagal dengan `Not logged in`.
 
 ## Berkas

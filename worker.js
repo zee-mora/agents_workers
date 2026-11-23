@@ -176,6 +176,9 @@ async function processWO(wo) {
     if (files.some(unsafeFile)) { result.status = 'NEEDS_REVIEW'; result.logs = 'menyentuh .env/.git: ' + files.filter(unsafeFile).join(', '); return false; }
     git(dir, 'commit', '-m', `WO ${wo.id}: ${wo.context}`.slice(0, 200));
     result.diff_stat = git(dir, 'diff', '--stat', base, 'HEAD');
+    result.head_sha = git(dir, 'rev-parse', 'HEAD'); // merge nanti hanya jika branch masih di commit ini
+    try { result.patch = execFileSync('git', ['-C', dir, 'diff', base, 'HEAD'], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).slice(0, 200 * 1024); }
+    catch { result.patch = '[diff terlalu besar untuk dikirim, lihat di laptop]'; }
 
     if (proj.verify) {
       const v = spawnSync('bash', ['-c', proj.verify], { cwd: dir, encoding: 'utf8', timeout: 300000 });
@@ -204,13 +207,78 @@ async function processWO(wo) {
   }
 }
 
+const gitNet = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8', timeout: 60000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+// Job merge setelah admin menekan Approve di VPS. Target branch ditentukan HANYA oleh projects.json laptop
+// ("target"); VPS tidak bisa memilih. Agent (claude) tidak terlibat dan tidak punya hak push.
+async function processMerge(wo) {
+  log(`MERGE ${wo.id} diterima`);
+  const out = { status: 'MERGE_FAILED', detail: '', sha: null, target: null };
+  const hb = setInterval(() => api('POST', `/api/wo/${wo.id}/heartbeat`, {}).catch(() => {}), 30000);
+  let dir, origBranch, targetPrev;
+  try {
+    const proj = JSON.parse(fs.readFileSync(path.join(__dirname, 'projects.json'), 'utf8'))[wo.project_key];
+    const r = wo.result || {};
+    if (!proj) throw new Error('project_key tidak ada di projects.json');
+    if (!proj.target) throw new Error('project ini belum diizinkan merge: tambahkan "target" (mis. "development") di projects.json laptop');
+    if (!/^[\w][\w./-]*$/.test(proj.target)) throw new Error('nama target tidak valid');
+    if (!/^wo\/[\w.-]+$/.test(r.branch || '') || !/^[0-9a-f]{7,40}$/.test(r.head_sha || '')) throw new Error('branch/head_sha tidak valid');
+    dir = proj.path; out.target = proj.target;
+    if (git(dir, 'status', '--porcelain')) throw new Error('working tree kotor, merge ditolak');
+    const head = git(dir, 'rev-parse', '--verify', r.branch);
+    if (!head.startsWith(r.head_sha)) throw new Error(`branch berubah sejak direview (${head.slice(0, 8)} != ${r.head_sha.slice(0, 8)})`);
+
+    origBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
+    gitNet(dir, 'fetch', 'origin', proj.target);
+    git(dir, 'switch', proj.target);
+    targetPrev = git(dir, 'rev-parse', 'HEAD');
+    try { git(dir, 'merge', '--ff-only', `origin/${proj.target}`); } // susul origin; menyimpang = berhenti
+    catch { throw new Error(`${proj.target} lokal menyimpang dari origin/${proj.target}, rapikan manual`); }
+    try { git(dir, 'merge', '--no-edit', r.branch); }
+    catch (e) { try { git(dir, 'merge', '--abort'); } catch { /* tidak ada merge berjalan */ } throw new Error('konflik merge, dibatalkan: ' + tail(e.message, 500)); }
+    gitNet(dir, 'push', 'origin', proj.target);
+    out.sha = git(dir, 'rev-parse', 'HEAD');
+    out.status = 'MERGED';
+    out.detail = `${r.branch} di-merge ke ${proj.target} dan di-push`;
+  } catch (e) {
+    out.detail = tail(e.message, 1500);
+    // push gagal setelah merge lokal: kembalikan target lokal ke keadaan semula
+    try { if (dir && targetPrev && git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') === out.target) git(dir, 'reset', '--hard', targetPrev); } catch { /* biarkan */ }
+  } finally {
+    clearInterval(hb);
+    try { if (dir && origBranch && git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') !== origBranch) git(dir, 'switch', origBranch); } catch { /* biarkan */ }
+    try { await api('POST', `/api/wo/${wo.id}/merge-result`, out, 30000); log(`MERGE ${wo.id} -> ${out.status}: ${out.detail}`); }
+    catch (e) { log(`gagal lapor merge ${wo.id}: ${e.message} (lease akan habis)`); }
+  }
+}
+
+// Daftarkan nama project (key + target merge, TANPA path) ke VPS untuk dropdown UI dan validasi WO.
+// Dikirim saat start, saat projects.json berubah, dan tiap 10 menit.
+let regMtime = 0, regAt = 0;
+async function registerProjects() {
+  try {
+    const f = path.join(__dirname, 'projects.json');
+    const m = fs.statSync(f).mtimeMs;
+    if (m === regMtime && Date.now() - regAt < 600000) return;
+    const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const projects = Object.entries(cfg).map(([key, p]) => ({ key, target: (p && p.target) || null }));
+    await api('POST', '/api/wo/projects', { projects });
+    regMtime = m; regAt = Date.now();
+    log(`project terdaftar: ${projects.map((p) => p.key + (p.target ? '→' + p.target : '')).join(', ')}`);
+  } catch (e) {
+    log('gagal mendaftarkan project:', e.message); // dicoba lagi di siklus berikutnya
+  }
+}
+
 async function main() {
   if (!TOKEN) { console.error('WORKER_TOKEN kosong (isi .env)'); process.exit(1); }
   log(`worker aktif -> ${VPS_URL}`);
   for (;;) {
+    await registerProjects();
     try {
-      const { wo } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}`, null, (POLL_WAIT + 10) * 1000);
+      const { wo, kind } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}`, null, (POLL_WAIT + 10) * 1000);
       if (!wo) { await sleep(2000); continue; }
+      if (kind === 'merge' || wo.status === 'MERGING') { await processMerge(wo); continue; } // jangan pernah menjalankan agent untuk job merge
       if (await processWO(wo)) { log('kuota/login bermasalah, jeda 10 menit'); await sleep(PAUSE_MS); }
     } catch (e) {
       log('polling error:', e.message);
