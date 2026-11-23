@@ -78,7 +78,11 @@ function add(line) {
 const es = new EventSource('/events');
 // Tiap (re)connect server mengirim ulang seluruh buffer: kosongkan dulu agar tidak dobel.
 es.addEventListener('open', () => { log.replaceChildren(); $('empty').hidden = false; last = ''; });
-es.addEventListener('state', (e) => { st = JSON.parse(e.data); render(); });
+es.addEventListener('state', (e) => {
+  const n = JSON.parse(e.data);
+  if (n.wo_id && n.wo_id !== st.wo_id) { log.replaceChildren(); $('empty').hidden = false; last = ''; } // WO baru: transkrip baru
+  st = n; render();
+});
 es.addEventListener('line', (e) => add(JSON.parse(e.data)));
 const post = (p) => fetch(p, { method: 'POST', headers: { 'X-Worker-UI': '1' } });
 $('start').onclick = () => post('/start');

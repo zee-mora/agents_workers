@@ -370,6 +370,10 @@ function selftest() {
   assert.strictEqual(ui.redact('a'.repeat(300), '/r').length, 200);
   for (let i = 0; i < 501; i++) ui.push('baris ' + i);
   assert.ok(ui.state.activity.length === 500 && ui.state.activity[0] === 'baris 1');
+  ui.setPhase('wo', { wo_id: 'a' }); ui.push('x');
+  ui.setPhase('wo', { wo_id: 'a' }); assert.strictEqual(ui.state.activity.length, 1, 'WO sama: aktivitas dipertahankan');
+  ui.setPhase('wo', { wo_id: 'b' }); assert.strictEqual(ui.state.activity.length, 0, 'WO baru: aktivitas dikosongkan');
+  ui.setPhase('idle', { wo_id: null });
   const rq = (method, headers) => ({ method, headers });
   assert.ok(ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: '127.0.0.1:8787' }), 8787));
   assert.ok(ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: 'localhost:8787' }), 8787));

@@ -49,6 +49,7 @@ function push(line) {
 }
 
 function setPhase(phase, info = {}) {
+  if (info.wo_id && info.wo_id !== state.wo_id) state.activity.length = 0; // WO baru: mulai transkrip baru
   Object.assign(state, { phase }, info);
   broadcast('state', snapshot());
 }
