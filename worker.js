@@ -336,8 +336,38 @@ function selftest() {
   assert.ok(!ui.csrfOk(rq('POST', { host: '127.0.0.1:8787' }), 8787));
   assert.ok(!ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: 'evil.com' }), 8787));
   assert.ok(!ui.csrfOk(rq('POST', { 'x-worker-ui': '1', host: '127.0.0.1:9999' }), 8787));
-  console.log('selftest OK');
+  return selftestServer(assert, ui).then(() => console.log('selftest OK'));
 }
 
-if (process.argv.includes('--selftest')) selftest();
+async function selftestServer(assert, ui) {
+  const http = require('http');
+  const call = (port, method, p, headers = {}) => new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port, method, path: p, headers }, (s) => {
+      let b = '';
+      s.on('data', (d) => { b += d; if (p === '/events') { s.destroy(); resolve({ status: s.statusCode, body: b }); } });
+      s.on('end', () => resolve({ status: s.statusCode, body: b }));
+    });
+    r.on('error', reject); r.end();
+  });
+  let stops = 0, starts = 0;
+  const srv = await ui.startUI({ port: 0, onStart() { starts++; }, onStop() { stops++; } });
+  const port = srv.address().port;
+  const ok = { 'x-worker-ui': '1', host: `127.0.0.1:${port}` };
+  assert.strictEqual((await call(port, 'POST', '/stop')).status, 403);
+  assert.strictEqual((await call(port, 'POST', '/stop', { ...ok, host: 'evil.com' })).status, 403);
+  assert.strictEqual(ui.state.enabled, true);
+  assert.strictEqual((await call(port, 'POST', '/stop', ok)).status, 204);
+  assert.ok(stops === 1 && ui.state.enabled === false);
+  assert.strictEqual((await call(port, 'POST', '/start', ok)).status, 204);
+  assert.ok(starts === 1 && ui.state.enabled === true);
+  assert.strictEqual((await call(port, 'GET', '/nope')).status, 404);
+  assert.strictEqual((await call(port, 'PUT', '/')).status, 405);
+  const page = await call(port, 'GET', '/');
+  assert.ok(page.status === 200 && page.body.includes('Start') && page.body.includes('Stop'));
+  assert.ok((await call(port, 'GET', '/events')).body.startsWith('event: state'));
+  assert.strictEqual(await ui.startUI({ port, onStart() {}, onStop() {} }), null); // port dipakai: UI nonaktif, tidak melempar
+  srv.closeAllConnections(); srv.close();
+}
+
+if (process.argv.includes('--selftest')) selftest().catch((e) => { console.error(e); process.exit(1); });
 else main();
