@@ -51,6 +51,8 @@ POLL_WAIT=25
   }
 }
 ```
+`db_sync` (opsional): `{ "cmd": "<perintah bash>", "ttl_hours": 6 }`. Sebelum agent jalan, jika sinkron terakhir lebih tua dari `ttl_hours`, worker menjalankan `cmd` (cwd = folder project, tanpa `WORKER_TOKEN`). Gagal = WO `FAILED`, agent tidak jalan. Kredensial DB taruh di script/`~/.my.cnf` laptop, bukan di repo. Contoh: `ssh USER@HOST "mysqldump --single-transaction --quick --no-tablespaces DB | gzip" | gunzip | mysql DB_LOKAL`. Gunakan DB lokal khusus worker karena isinya ditimpa. Siap pakai: `scripts/sync-db.sh <db-di-server> <db-lokal>` menarik `GET /api/wo/db-dump` dari VPS (hanya DB di `ORCH_DUMP_DBS` di env server) dan merestore dengan `SYNC_MYSQL_USER`/`SYNC_MYSQL_PASSWORD` dari `.env` worker; `--dump-only` untuk tes tanpa restore. Contoh `cmd`: `./scripts/sync-db.sh oso_marketing_db oso_new`.
+
 `verify`, `url`, dan `target` opsional. `verify` hanya dari file ini, tidak pernah dari WO.
 
 Permanen dengan PM2:

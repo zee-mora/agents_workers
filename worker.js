@@ -81,10 +81,11 @@ function localUrlOk(u) {
   try { return ['localhost', '127.0.0.1'].includes(new URL(u).hostname); } catch { return false; }
 }
 
-function buildPrompt(wo) {
-  const goals = wo.goals.map((g, i) => `${i + 1}. ${g}`).join('\n');
+function buildPrompt(wo, imgPaths = []) {
+  const goals = (wo.goals || []).length ? `\n\nGoals:\n${wo.goals.map((g, i) => `${i + 1}. ${g}`).join('\n')}` : '';
   const hint = (wo.files_hint || []).length ? `\n\nFile untuk dimulai:\n${wo.files_hint.join('\n')}` : '';
-  return `Context: ${wo.context}\n\nGoals:\n${goals}${hint}`;
+  const imgs = imgPaths.length ? `\n\nAttached images (read them with the Read tool):\n${imgPaths.join('\n')}` : '';
+  return `Context: ${wo.context}${goals}${hint}${imgs}`;
 }
 
 // ---------- VPS API ----------
@@ -100,9 +101,54 @@ async function api(method, p, body, timeoutMs = 15000, signal) {
   return res.json();
 }
 
+// Sinkron DB sebelum agent jalan: hanya jika data lebih tua dari ttl. Async supaya heartbeat tetap jalan.
+// `cmd` datang dari projects.json (file laptop, dipercaya seperti `verify`), tidak pernah dari WO.
+const SYNC_DIR = path.join(__dirname, '.sync');
+function syncAge(key, now = Date.now()) {
+  try { return now - fs.statSync(path.join(SYNC_DIR, key)).mtimeMs; } catch { return Infinity; }
+}
+async function syncDb(key, proj, now = Date.now()) {
+  const c = proj.db_sync;
+  if (!c || !c.cmd || syncAge(key, now) < (Number(c.ttl_hours) || 6) * 3600 * 1000) return false;
+  log(`sync DB ${key}…`);
+  const env = { ...process.env, VPS_URL }; // script sync (milik laptop, dipercaya) butuh WORKER_TOKEN untuk db-dump
+  const out = await new Promise((resolve) => {
+    const p = spawn('bash', ['-c', c.cmd], { cwd: proj.path, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let buf = '';
+    const t = setTimeout(() => p.kill('SIGKILL'), 30 * 60 * 1000);
+    p.stdout.on('data', (d) => { buf = (buf + d).slice(-1500); });
+    p.stderr.on('data', (d) => { buf = (buf + d).slice(-1500); });
+    p.on('error', (e) => { clearTimeout(t); resolve({ code: -1, buf: String(e) }); });
+    p.on('close', (code) => { clearTimeout(t); resolve({ code, buf }); });
+  });
+  if (out.code !== 0) throw new Error(`sync DB gagal (exit ${out.code}): ${tail(out.buf, 500)}`);
+  fs.mkdirSync(SYNC_DIR, { recursive: true });
+  fs.writeFileSync(path.join(SYNC_DIR, key), String(now));
+  return true;
+}
+
+// Unduh lampiran WO ke folder sementara di luar repo. Nama file dari VPS divalidasi dulu.
+async function downloadImages(wo) {
+  const names = Array.isArray(wo.images) ? wo.images : [];
+  if (!names.length) return { dir: null, paths: [] };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `wo-${wo.id}-`));
+  try {
+    const paths = [];
+    for (const n of names) {
+      if (!/^[a-f0-9]{16}\.(png|jpg|webp|gif)$/.test(n)) throw new Error('nama lampiran tidak valid');
+      const res = await fetch(`${VPS_URL}/api/wo/${wo.id}/img/${n}`, { headers: { Authorization: `Bearer ${TOKEN}` }, signal: AbortSignal.timeout(30000) });
+      if (!res.ok) throw new Error(`GET lampiran -> ${res.status}`);
+      const f = path.join(dir, n);
+      fs.writeFileSync(f, Buffer.from(await res.arrayBuffer()), { mode: 0o600 });
+      paths.push(f);
+    }
+    return { dir, paths };
+  } catch (e) { fs.rmSync(dir, { recursive: true, force: true }); throw e; }
+}
+
 // ---------- eksekusi ----------
 
-function runClaude(cwd, prompt, wo) {
+function runClaude(cwd, prompt, wo, addDir) {
   const lim = wo.limits || {};
   const budget = Math.min(Number(lim.max_budget_usd) || 0.5, MAX_BUDGET);
   const timeout = Math.min(Number(lim.timeout_sec) || 600, MAX_TIMEOUT) * 1000;
@@ -110,9 +156,11 @@ function runClaude(cwd, prompt, wo) {
   // prompt harus sebelum --allowedTools (variadic). Tanpa shell: tidak ada injection.
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--model', model,
     '--max-budget-usd', String(budget), '--permission-mode', 'acceptEdits',
+    ...(addDir ? ['--add-dir', addDir] : []),
     '--append-system-prompt', RULES, '--allowedTools', ALLOWED_TOOLS];
   const env = { ...process.env };
   delete env.WORKER_TOKEN; // agent tidak boleh melihat token VPS
+  delete env.SYNC_MYSQL_USER; delete env.SYNC_MYSQL_PASSWORD; // dan tidak boleh melihat login MySQL untuk sync
 
   return new Promise((resolve) => {
     const p = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -168,7 +216,7 @@ async function processWO(wo) {
   const result = { status: 'FAILED', exit_code: null, turns: null, tokens: null, cost_usd: null,
     diff_stat: null, verify_passed: null, branch: null, logs: '' };
   const hb = setInterval(() => api('POST', `/api/wo/${wo.id}/heartbeat`, {}).catch(() => {}), 30000);
-  let dir, base, shot, quota = false;
+  let dir, base, shot, imgDir, quota = false;
 
   try {
     const proj = JSON.parse(fs.readFileSync(path.join(__dirname, 'projects.json'), 'utf8'))[wo.project_key];
@@ -177,12 +225,19 @@ async function processWO(wo) {
     if (!fs.existsSync(dir)) { result.logs = `folder tidak ada: ${dir}`; return false; }
     if (git(dir, 'status', '--porcelain')) { result.logs = 'working tree kotor, WO ditolak'; return false; }
 
+    try { await syncDb(wo.project_key, proj); }
+    catch (e) { result.logs = `WO tidak dijalankan: ${e.message}`; return false; } // jangan kerja di data basi tanpa sepengetahuan
+
+    let imgPaths = [];
+    try { ({ dir: imgDir, paths: imgPaths } = await downloadImages(wo)); }
+    catch (e) { result.logs = `gagal mengunduh lampiran, WO tidak dijalankan: ${e.message}`; return false; }
+
     base = git(dir, 'rev-parse', 'HEAD');
     const baseBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
     result.branch = `wo/${wo.id}-${wo.attempts || 0}`;
     git(dir, 'switch', '-c', result.branch);
 
-    const run = await runClaude(dir, buildPrompt(wo), wo);
+    const run = await runClaude(dir, buildPrompt(wo, imgPaths), wo, imgDir);
     result.exit_code = run.code;
     if (run.timedOut) { result.logs = 'timeout, proses dihentikan'; return false; }
 
@@ -232,6 +287,7 @@ async function processWO(wo) {
     catch (e) { log(`gagal lapor WO ${wo.id}: ${e.message} (lease akan habis)`); }
     ui.setPhase('idle', { wo_id: null, project_key: null }); // idle hanya setelah laporan terkirim (Stop menunggu ini)
     if (shot) fs.rm(shot, () => {});
+    if (imgDir) fs.rm(imgDir, { recursive: true, force: true }, () => {});
   }
 }
 
@@ -279,6 +335,8 @@ async function processMerge(wo) {
     out.sha = git(dir, 'rev-parse', 'HEAD');
     out.status = 'MERGED';
     out.detail = `${r.branch} di-merge ke ${proj.target} dan di-push`;
+    try { git(dir, 'branch', '-d', r.branch); out.detail += ' (branch WO dihapus)'; } // -d aman: hanya hapus jika sudah ter-merge
+    catch (e) { log(`branch ${r.branch} tidak dihapus: ${e.message}`); }
   } catch (e) {
     out.detail = tail(e.message, 1500);
     // push gagal setelah merge lokal: kembalikan target lokal ke keadaan semula
@@ -362,6 +420,10 @@ function selftest() {
   assert.ok(unsafeFile('app/.env') && unsafeFile('.git/config') && !unsafeFile('src/env.js'));
   assert.ok(localUrlOk('http://localhost:8000/x') && !localUrlOk('http://evil.com') && !localUrlOk('file:///etc/passwd'));
   assert.ok(buildPrompt({ context: 'c', goals: ['a', 'b'], files_hint: ['f.js'] }).includes('2. b'));
+  const ip = buildPrompt({ context: 'c', goals: ['a'] }, ['/tmp/x/a.png']);
+  assert.ok(ip.includes('Attached images (read them with the Read tool):\n/tmp/x/a.png'));
+  assert.ok(!buildPrompt({ context: 'c', goals: ['a'] }).includes('Attached images'));
+  assert.ok(!buildPrompt({ context: 'c', goals: [] }).includes('Goals'));
   const ui = require('./ui');
   const tu = (name, input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
   assert.deepStrictEqual(ui.summarize(tu('Edit', { file_path: '/home/x/proj/app/Foo.php' }), '/home/x/proj'), ['Edit app/Foo.php']);
@@ -412,7 +474,21 @@ function selftest() {
   assert.deepStrictEqual(mergeClash(tmp, 'wo/x', 'main'), ['a.txt'], 'file sama: bentrok');
   assert.ok(base0);
   fs.rmSync(tmp, { recursive: true });
-  return sw.then(() => selftestServer(assert, ui)).then(() => console.log('selftest OK'));
+  return sw.then(() => selftestSync(assert)).then(() => selftestServer(assert, ui)).then(() => console.log('selftest OK'));
+}
+
+async function selftestSync(assert) {
+  const key = 'selftest-' + process.pid, f = path.join(SYNC_DIR, key);
+  const run = (cmd, ttl, now) => syncDb(key, { path: '.', db_sync: { cmd, ttl_hours: ttl } }, now);
+  try {
+    assert.strictEqual(syncAge(key), Infinity);
+    await assert.rejects(run('echo boom >&2; exit 3'), /exit 3.*boom/s);
+    assert.ok(!fs.existsSync(f)); // gagal = tidak dianggap segar
+    assert.strictEqual(await run('true'), true);
+    assert.strictEqual(await run('exit 9'), false); // masih segar: tidak dijalankan
+    assert.strictEqual(await run('true', 1, Date.now() + 2 * 3600e3), true); // lewat ttl: jalan lagi
+    assert.strictEqual(await syncDb(key, { path: '.' }), false); // tanpa db_sync: dilewati
+  } finally { fs.rmSync(f, { force: true }); }
 }
 
 async function selftestServer(assert, ui) {
