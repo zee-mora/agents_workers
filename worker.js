@@ -32,7 +32,10 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 // ---------- fungsi murni (dites di --selftest) ----------
 
 function parseResult(out) {
-  const d = JSON.parse(out);
+  // stream-json: NDJSON, ambil event `result` terakhir. Format lama: satu objek JSON utuh.
+  const ev = out.split('\n').flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+  const d = ev.some((e) => e.type) ? ev.findLast((e) => e.type === 'result') : JSON.parse(out);
+  if (!d) throw new Error('tidak ada event result');
   const mu = Object.values(d.modelUsage || {}); // `usage` level atas selalu 0, pakai modelUsage
   const sum = (k) => mu.reduce((a, m) => a + (m[k] || 0), 0);
   return {
@@ -296,6 +299,10 @@ function selftest() {
   const r = parseResult(ok);
   assert.deepStrictEqual(r.tokens, { input: 5, output: 7, cache_read: 11, cache_creation: 13 });
   assert.strictEqual(classify(r), null);
+  const nd = [{ type: 'system', subtype: 'init' }, { type: 'assistant', message: { content: [] } }, { type: 'result', ...JSON.parse(ok) }].map((e) => JSON.stringify(e)).join('\n');
+  assert.deepStrictEqual(parseResult(nd).tokens, { input: 5, output: 7, cache_read: 11, cache_creation: 13 });
+  assert.strictEqual(parseResult('{"type":"system"}\nrusak{\n' + nd).cost, 0.1);
+  assert.throws(() => parseResult('{"type":"system","subtype":"init"}\n{"type":"assistant"}'));
   const budget = parseResult(JSON.stringify({ is_error: true, subtype: 'error_max_budget_usd', errors: ['Reached maximum budget'] }));
   assert.strictEqual(classify(budget), 'OVER_BUDGET');
   assert.strictEqual(isQuota(budget), false);
