@@ -447,6 +447,29 @@ async function processMerge(wo) {
   }
 }
 
+// Hapus branch lokal WO yang di-reject. Aman: hanya `wo/*`, hanya jika branch masih di commit yang direview
+// (kalau ada commit tambahan dari tangan, jangan dibuang), dan tidak menyentuh working tree.
+// Branch WO tidak pernah di-push, jadi tidak ada branch remote untuk dihapus.
+function deleteWoBranch(dir, r) {
+  if (!/^wo\/[\w.-]+$/.test(r.branch || '')) return { status: 'FAILED', detail: 'nama branch tidak valid' };
+  let head;
+  try { head = git(dir, 'rev-parse', '--verify', '--quiet', `refs/heads/${r.branch}`); } catch { return { status: 'SKIPPED', detail: 'branch sudah tidak ada' }; }
+  if (r.head_sha && !head.startsWith(r.head_sha)) return { status: 'SKIPPED', detail: `branch berubah sejak direview (${head.slice(0, 8)}), tidak dihapus` };
+  try { git(dir, 'branch', '-D', r.branch); } catch (e) { return { status: 'FAILED', detail: tail(String(e.stderr || e.message), 300) }; }
+  return { status: 'DONE', detail: `branch ${r.branch} dihapus` };
+}
+
+async function processCleanup(wo) {
+  log(`CLEANUP ${wo.id} diterima`);
+  let out;
+  try {
+    const proj = JSON.parse(fs.readFileSync(path.join(__dirname, 'projects.json'), 'utf8'))[wo.project_key];
+    out = proj ? deleteWoBranch(proj.path, wo.result || {}) : { status: 'FAILED', detail: 'project_key tidak ada di projects.json' };
+  } catch (e) { out = { status: 'FAILED', detail: tail(e.message, 300) }; }
+  try { await api('POST', `/api/wo/${wo.id}/cleanup-result`, out, 30000); log(`CLEANUP ${wo.id} -> ${out.status}: ${out.detail}`); }
+  catch (e) { log(`gagal lapor cleanup ${wo.id}: ${e.message} (lease akan habis, dicoba ulang)`); }
+}
+
 // Daftarkan nama project (key + target merge, TANPA path) ke VPS untuk dropdown UI dan validasi WO.
 // Dikirim saat start, saat projects.json berubah, dan tiap 10 menit.
 let regMtime = 0, regAt = 0;
@@ -481,8 +504,9 @@ async function main() {
     await registerProjects();
     try {
       pollAbort = new AbortController();
-      const { wo, kind } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}`, null, (POLL_WAIT + 10) * 1000, pollAbort.signal);
+      const { wo, kind } = await api('GET', `/api/wo/next?wait=${POLL_WAIT}&cleanup=1`, null, (POLL_WAIT + 10) * 1000, pollAbort.signal);
       if (!wo) { await sleep(2000); continue; }
+      if (kind === 'cleanup') { await processCleanup(wo); continue; } // tanpa agent: hanya git branch -D
       if (kind === 'merge' || wo.status === 'MERGING') { await processMerge(wo); continue; } // jangan pernah menjalankan agent untuk job merge
       if (await processWO(wo)) {
         log('kuota/login bermasalah, jeda 10 menit');
@@ -586,6 +610,18 @@ function selftest() {
   g('update-ref', 'refs/remotes/origin/main', 'main');
   assert.deepStrictEqual(mergeClash(tmp, 'wo/x', 'main'), ['a.txt'], 'file sama: bentrok');
   assert.ok(base0);
+  // deleteWoBranch: hapus branch yang tidak berubah; tolak yang punya commit tambahan; abaikan yang sudah hilang
+  const woHead = g('rev-parse', 'wo/x');
+  assert.deepStrictEqual(deleteWoBranch(tmp, { branch: 'wo/x', head_sha: woHead.slice(0, 7) }), { status: 'DONE', detail: 'branch wo/x dihapus' });
+  assert.strictEqual(deleteWoBranch(tmp, { branch: 'wo/x', head_sha: woHead }).status, 'SKIPPED', 'sudah hilang');
+  g('switch', '-q', '-c', 'wo/y'); commit('c.txt', 'c1'); g('switch', '-q', 'main');
+  assert.strictEqual(deleteWoBranch(tmp, { branch: 'wo/y', head_sha: base0 }).status, 'SKIPPED', 'branch berubah: jangan dibuang');
+  assert.ok(g('rev-parse', '--verify', 'wo/y'));
+  g('switch', '-q', 'wo/y');
+  assert.strictEqual(deleteWoBranch(tmp, { branch: 'wo/y', head_sha: g('rev-parse', 'HEAD') }).status, 'FAILED', 'sedang di-checkout: git menolak');
+  g('switch', '-q', 'main');
+  for (const bad of ['main', 'development', '../x', 'wo/', '-D']) assert.strictEqual(deleteWoBranch(tmp, { branch: bad, head_sha: base0 }).status, 'FAILED', bad);
+  assert.ok(g('rev-parse', '--verify', 'main'));
   fs.rmSync(tmp, { recursive: true });
   return sw.then(() => selftestSync(assert)).then(() => selftestServer(assert, ui)).then(() => console.log('selftest OK'));
 }
