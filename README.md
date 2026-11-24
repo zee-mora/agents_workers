@@ -18,6 +18,7 @@ Sisi server ada di repo `vps-monitor` (`orchestrator.js`, `docs/orchestrator.md`
    - `git diff` tidak kosong. Kosong jadi `FAILED`.
    - Tidak menyentuh `.env` atau `.git/`. Kalau menyentuh: `NEEDS_REVIEW`.
    - Perubahan di-commit ke branch WO, lalu `verify` dari `projects.json` dijalankan. Gagal: `NEEDS_REVIEW`.
+   - Kompleksitas dinilai dari diff + baris `COMPLEXITY:` dari agent, hasil terberat menang, dikirim sebagai `result.complexity` / `complexity_reason`. `complex` jika menyentuh struktur DB (migrasi, `.sql`, `ALTER/CREATE TABLE`, model), struktur app (file kode dihapus/dipindah, >=3 file kode baru, routing/entry point), dependency/deploy (`package.json`, Dockerfile, nginx, workflow), auth/keamanan/pembayaran, >10 file, atau agent menandai complex. Daftar sinyal: `CX_SIGNALS` di `worker.js`. Sinyal keras (DB, file kode dihapus/dipindah, >=3 file kode baru) tidak bisa diturunkan; sinyal lemah (routing, dependency/deploy, auth, >10 file) bisa diturunkan agent ke `simple` jika `COMPLEXITY: simple - <alasan>` menyertakan alasan.
    - Screenshot Playwright (opsional, hanya localhost). Gagal screenshot tidak menggagalkan WO.
 7. `POST /api/wo/:id/complete` dengan status, hasil, dan screenshot base64 (maks 2 MB). Worker kembali ke branch semula. Merge dilakukan manusia.
 

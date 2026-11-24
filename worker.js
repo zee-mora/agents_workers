@@ -23,7 +23,32 @@ const RULES = [
   '- Jangan mengklaim sesuatu lulus/jalan tanpa menjalankan perintahnya.',
   '- Tidak yakin atau butuh info yang tidak ada: berhenti dan tulis "BLOCKED: <alasan>". Jangan mengarang.',
   '- Jawaban akhir maksimal 10 baris: file yang diubah + alasan.',
+  '- Akhiri jawaban dengan satu baris `COMPLEXITY: simple|complex - alasan singkat`. complex = mengubah struktur database (tabel/kolom/index/migrasi), struktur app (file/modul baru, dihapus, dipindah, routing, dependency, config deploy), logika auth/keamanan/pembayaran, atau perubahan lintas banyak modul, atau kamu ragu. Selain itu simple.',
 ].join('\n');
+
+// Penilaian kompleksitas WO (dipakai VPS untuk prioritas audit). Deterministik dari diff, ditambah
+// penilaian agent (baris `COMPLEXITY:`); hasil akhir = yang terberat. Daftar sinyal sengaja konservatif:
+// salah-complex hanya menambah antrean audit, salah-simple melewatkan perubahan berisiko.
+const CX_SIGNALS = [ // [label, cocok per file, cocok per diff, keras?]. Keras = agent tidak boleh menurunkan.
+  ['struktur database', (f) => /(^|\/)(migrations?|migrate|schema|seeders?)(\/|\.|$)|\.sql$|prisma\/schema|(^|\/)models?\//i.test(f.path), (p) => /^\+.*\b(CREATE|ALTER|DROP|TRUNCATE)\s+(TABLE|INDEX|COLUMN|DATABASE)\b|^\+.*\bADD\s+COLUMN\b|\$table->|Schema::|db\.(create|drop)Collection/im.test(p), true],
+  ['struktur app (file ditambah/dihapus/dipindah)', (f) => /^[DR]/.test(f.st) && /\.(js|ts|jsx|tsx|py|php|rb|go|java|vue|svelte)$/.test(f.path), null, true],
+  ['routing/entry point', (f) => /(^|\/)(routes?|router|server|app|main|index)\.(js|ts|py|php)$|(^|\/)routes?\//i.test(f.path)],
+  ['dependency/build/deploy', (f) => /(^|\/)(package\.json|composer\.json|requirements\.txt|pyproject\.toml|go\.mod|Dockerfile|docker-compose\.ya?ml|ecosystem\.config\.js|nginx[^/]*\.conf|\.github\/workflows\/.+)$/.test(f.path)],
+  ['auth/keamanan/pembayaran', (f) => /auth|login|password|permission|session|csrf|token|payment|billing|middleware/i.test(f.path)],
+];
+function assessComplexity(nameStatus, patch, agentText) {
+  const files = String(nameStatus || '').split('\n').filter(Boolean).map((l) => { const [st, ...p] = l.split('\t'); return { st, path: p[p.length - 1] }; });
+  const why = []; let hard = false;
+  for (const [label, byFile, byPatch, h] of CX_SIGNALS) if (files.some(byFile) || (byPatch && byPatch(patch || ''))) { why.push(label); hard ||= !!h; }
+  const added = files.filter((f) => f.st === 'A' && /\.(js|ts|jsx|tsx|py|php|rb|go|java|vue|svelte)$/.test(f.path)).length;
+  if (added >= 3) { why.push(`${added} file kode baru`); hard = true; }
+  if (files.length > 10) why.push(`${files.length} file berubah`);
+  const m = /^COMPLEXITY:\s*(simple|complex)\b\s*[-—:]*\s*(.*)$/im.exec(agentText || '');
+  const agent = m && m[1].toLowerCase(), note = m ? m[2].trim() : '';
+  if (agent === 'complex') why.push('agent: ' + (note || 'ditandai complex'));
+  else if (agent === 'simple' && why.length && !hard && note) return { complexity: 'simple', reason: `diturunkan agent (${note}); sinyal kode: ${why.join(', ')}`.slice(0, 300) };
+  return { complexity: why.length ? 'complex' : 'simple', reason: (why.join('; ') || 'perubahan kecil, tanpa sinyal struktur/DB').slice(0, 300) };
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const tail = (s, n = 2000) => String(s || '').slice(-n);
@@ -332,6 +357,7 @@ async function processWO(wo) {
     result.head_sha = git(dir, 'rev-parse', 'HEAD'); // merge nanti hanya jika branch masih di commit ini
     try { result.patch = execFileSync('git', ['-C', dir, 'diff', base, 'HEAD'], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).slice(0, 200 * 1024); }
     catch { result.patch = '[diff terlalu besar untuk dikirim, lihat di laptop]'; }
+    { const a = assessComplexity(git(dir, 'diff', '--name-status', '-M', base, 'HEAD'), result.patch, r.text); result.complexity = a.complexity; result.complexity_reason = a.reason; }
 
     if (proj.verify) {
       const v = spawnSync('bash', ['-c', proj.verify], { cwd: dir, encoding: 'utf8', timeout: 300000 });
@@ -493,6 +519,16 @@ function selftest() {
   assert.strictEqual(isQuota(login), true);
   assert.ok(unsafeFile('app/.env') && unsafeFile('.git/config') && !unsafeFile('src/env.js'));
   assert.ok(localUrlOk('http://localhost:8000/x') && !localUrlOk('http://evil.com') && !localUrlOk('file:///etc/passwd'));
+  assert.strictEqual(assessComplexity('M\tsrc/a.js', '+x', '').complexity, 'simple');
+  assert.strictEqual(assessComplexity('A\tdb/migrations/001.sql', '', '').complexity, 'complex');
+  assert.strictEqual(assessComplexity('M\tsrc/a.js', '+ALTER TABLE t ADD COLUMN c int', '').complexity, 'complex');
+  assert.strictEqual(assessComplexity('R100\told.js\tnew.js', '', '').complexity, 'complex');
+  assert.strictEqual(assessComplexity('M\tsrc/a.js', '+x', 'COMPLEXITY: complex - ubah alur').complexity, 'complex');
+  assert.strictEqual(assessComplexity('M\tsrc/a.js', '+x', 'COMPLEXITY: simple - typo').complexity, 'simple');
+  assert.strictEqual(assessComplexity('M\tnginx-x.conf', '+x', 'COMPLEXITY: simple - ganti regex').complexity, 'simple'); // sinyal lemah, agent menurunkan
+  assert.strictEqual(assessComplexity('M\tnginx-x.conf', '+x', 'COMPLEXITY: simple').complexity, 'complex'); // tanpa alasan: tidak diturunkan
+  assert.strictEqual(assessComplexity('D\tsrc/a.js', '', 'COMPLEXITY: simple - hapus file mati').complexity, 'complex'); // sinyal keras
+  assert.strictEqual(assessComplexity('M\tdb/x.sql', '', 'COMPLEXITY: simple - kecil').complexity, 'complex');
   assert.ok(buildPrompt({ context: 'c', goals: ['a', 'b'], files_hint: ['f.js'] }).includes('2. b'));
   const ip = buildPrompt({ context: 'c', goals: ['a'] }, ['/tmp/x/a.png']);
   assert.ok(ip.includes('Attached images (read them with the Read tool):\n/tmp/x/a.png'));
