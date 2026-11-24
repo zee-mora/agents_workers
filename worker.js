@@ -352,7 +352,8 @@ async function processWO(wo) {
     if (/^BLOCKED:/m.test(r.text)) { result.status = 'NEEDS_REVIEW'; return false; }
     if (!files.length) { result.status = 'FAILED'; result.logs = 'agent tidak mengubah file. ' + result.logs; return false; }
     if (files.some(unsafeFile)) { result.status = 'NEEDS_REVIEW'; result.logs = 'menyentuh .env/.git: ' + files.filter(unsafeFile).join(', '); return false; }
-    git(dir, 'commit', '-m', `WO ${wo.id}: ${wo.context}`.slice(0, 200));
+    const who = String(wo.created_by || 'unknown').replace(/[^\w.@-]/g, '_');
+    git(dir, 'commit', '-m', `WO-${who}-${new Date().toLocaleDateString('sv')}: ${wo.context}`.slice(0, 200), '-m', `WO ${wo.id}`); // format: WO-<pembuat>-<tanggal selesai>
     result.diff_stat = git(dir, 'diff', '--stat', base, 'HEAD');
     result.head_sha = git(dir, 'rev-parse', 'HEAD'); // merge nanti hanya jika branch masih di commit ini
     try { result.patch = execFileSync('git', ['-C', dir, 'diff', base, 'HEAD'], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).slice(0, 200 * 1024); }
@@ -426,7 +427,7 @@ async function processMerge(wo) {
     targetPrev = git(dir, 'rev-parse', 'HEAD');
     try { git(dir, 'merge', '--ff-only', `origin/${proj.target}`); } // susul origin; menyimpang = berhenti
     catch { throw new Error(`${proj.target} lokal menyimpang dari origin/${proj.target}, rapikan manual`); }
-    try { git(dir, 'merge', '--no-edit', r.branch); }
+    try { git(dir, 'merge', '--no-ff', '-m', `Merge ${r.branch}`, '-m', `Approved-by: ${wo.approved_by || 'unknown'}\nWO: ${wo.id} (dibuat oleh ${wo.created_by || 'unknown'})`, r.branch); }
     catch (e) { try { git(dir, 'merge', '--abort'); } catch { /* tidak ada merge berjalan */ } throw new Error('konflik merge, dibatalkan: ' + tail(e.message, 500)); }
     gitNet(dir, 'push', 'origin', proj.target);
     out.sha = git(dir, 'rev-parse', 'HEAD');
