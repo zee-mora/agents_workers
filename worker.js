@@ -327,10 +327,17 @@ async function processWO(wo) {
     try { ({ dir: imgDir, paths: imgPaths } = await downloadImages(wo)); }
     catch (e) { result.logs = `gagal mengunduh lampiran, WO tidak dijalankan: ${e.message}`; return false; }
 
-    base = git(dir, 'rev-parse', 'HEAD');
     const baseBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
+    // Mulai dari origin/<target> terbaru, bukan HEAD lokal yang bisa tertinggal; kalau tidak, merge nanti
+    // bentrok dengan commit yang sudah ada di origin (MERGE_FAILED). Offline: pakai HEAD lokal.
+    let startPoint = 'HEAD';
+    if (proj.target && /^[\w][\w./-]*$/.test(proj.target)) {
+      try { gitNet(dir, 'fetch', 'origin', proj.target); startPoint = `origin/${proj.target}`; }
+      catch (e) { log(`fetch origin/${proj.target} gagal, WO dimulai dari HEAD lokal: ${tail(String(e.stderr || e.message), 200)}`); }
+    }
+    base = git(dir, 'rev-parse', startPoint);
     result.branch = `wo/${wo.id}-${wo.attempts || 0}`;
-    git(dir, 'switch', '-c', result.branch);
+    git(dir, 'switch', '--no-track', '-c', result.branch, base);
 
     const run = await runClaude(dir, buildPrompt(wo, imgPaths), wo, imgDir);
     result.exit_code = run.code;
