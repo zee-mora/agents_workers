@@ -112,7 +112,12 @@ function buildPrompt(wo, imgPaths = []) {
   const imgs = imgPaths.length ? `\n\nAttached images (read them with the Read tool):\n${imgPaths.join('\n')}` : '';
   const page = '\n\nJika perubahan terlihat di halaman web, akhiri jawaban dengan satu baris `PAGE: /path/halaman` (path saja, untuk screenshot).';
   const revs = wo.revision && Array.isArray(wo.revisions) ? wo.revisions : [];
-  const rev = revs.length ? `\n\nREVISI ke-${revs.length}: pekerjaan sebelumnya untuk WO ini sudah di-commit di branch yang sedang aktif (lihat \`git diff ${wo.revision.base_sha || 'HEAD~1'} HEAD\`). Reviewer meminta perbaikan; kerjakan catatan TERAKHIR, jangan mengulang dari nol:\n${revs.map((r, i) => `#${i + 1}: ${r.note}`).join('\n')}` : '';
+  const rev = revs.length ? `\n\nREVISI ke-${revs.length}: pekerjaan sebelumnya untuk WO ini sudah di-commit di branch yang sedang aktif (lihat \`git diff ${wo.revision.base_sha || 'HEAD~1'} HEAD\`). Reviewer meminta perbaikan; kerjakan catatan TERAKHIR, jangan mengulang dari nol:\n${revs.map((r, i) => {
+    const rg = (r.goals || []).length ? `\n   Goals: ${r.goals.join('; ')}` : '';
+    const rf = (r.files_hint || []).length ? `\n   File: ${r.files_hint.join(', ')}` : '';
+    const ri = imgPaths.filter((f) => (r.images || []).includes(path.basename(f))); // gambar pendukung revisi ini (sudah ada di daftar Attached images)
+    return `#${i + 1}: ${r.note}${rg}${rf}${ri.length ? `\n   Gambar: ${ri.join(', ')}` : ''}`;
+  }).join('\n')}` : '';
   return `Context: ${wo.context}${goals}${hint}${imgs}${rev}${page}`;
 }
 
@@ -605,6 +610,8 @@ function selftest() {
   const rp = buildPrompt({ context: 'c', revision: { n: 2, base_sha: 'abc1234' }, revisions: [{ note: 'satu' }, { note: 'dua' }] });
   assert.ok(rp.includes('REVISI ke-2') && rp.includes('#2: dua') && rp.includes('git diff abc1234 HEAD'));
   assert.ok(!buildPrompt({ context: 'c', revisions: [{ note: 'x' }] }).includes('REVISI'), 'tanpa revision: bukan revisi');
+  const rp2 = buildPrompt({ context: 'c', revision: { n: 1 }, revisions: [{ note: 'n', goals: ['g1'], files_hint: ['a.php'], images: ['0123456789abcdef.png'] }] }, ['/tmp/x/0123456789abcdef.png', '/tmp/x/fedcba9876543210.png']);
+  assert.ok(rp2.includes('Goals: g1') && rp2.includes('File: a.php') && rp2.includes('Gambar: /tmp/x/0123456789abcdef.png') && !rp2.includes('Gambar: /tmp/x/fedcba'));
   assert.strictEqual(pageUrl('http://localhost:8000', 'selesai\nPAGE: /attendance'), 'http://localhost:8000/attendance');
   assert.strictEqual(pageUrl('http://localhost:8000', 'PAGE: //evil.com/x'), 'http://localhost:8000');
   assert.strictEqual(pageUrl('http://localhost:8000', 'tanpa halaman'), 'http://localhost:8000');
