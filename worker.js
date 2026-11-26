@@ -345,7 +345,12 @@ async function processWO(wo) {
       const startPoint = syncTarget(dir, proj.target) ? `origin/${proj.target}` : 'HEAD';
       if (proj.target && startPoint === 'HEAD') log(`WO ${wo.id} dimulai dari HEAD lokal (origin/${proj.target} tidak bisa di-fetch)`);
       base = git(dir, 'rev-parse', startPoint);
-      result.branch = `wo/${wo.id}-${wo.attempts || 0}`;
+      // Nama bisa sudah terpakai jika WO dijalankan ulang tanpa attempts naik dan branch lama belum dibersihkan.
+      // Jangan timpa branch lama (mungkin masih direview); pakai akhiran -r2, -r3, ...
+      const branchTaken = (b) => { try { git(dir, 'rev-parse', '--verify', '--quiet', `refs/heads/${b}`); return true; } catch { return false; } };
+      const name0 = `wo/${wo.id}-${wo.attempts || 0}`;
+      result.branch = name0;
+      for (let i = 2; branchTaken(result.branch); i++) result.branch = `${name0}-r${i}`;
       git(dir, 'switch', '--no-track', '-c', result.branch, base);
     }
     result.base_sha = base;
