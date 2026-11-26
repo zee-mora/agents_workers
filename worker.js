@@ -330,11 +330,8 @@ async function processWO(wo) {
     const baseBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
     // Mulai dari origin/<target> terbaru, bukan HEAD lokal yang bisa tertinggal; kalau tidak, merge nanti
     // bentrok dengan commit yang sudah ada di origin (MERGE_FAILED). Offline: pakai HEAD lokal.
-    let startPoint = 'HEAD';
-    if (proj.target && /^[\w][\w./-]*$/.test(proj.target)) {
-      try { gitNet(dir, 'fetch', 'origin', proj.target); startPoint = `origin/${proj.target}`; }
-      catch (e) { log(`fetch origin/${proj.target} gagal, WO dimulai dari HEAD lokal: ${tail(String(e.stderr || e.message), 200)}`); }
-    }
+    const startPoint = syncTarget(dir, proj.target) ? `origin/${proj.target}` : 'HEAD';
+    if (proj.target && startPoint === 'HEAD') log(`WO ${wo.id} dimulai dari HEAD lokal (origin/${proj.target} tidak bisa di-fetch)`);
     base = git(dir, 'rev-parse', startPoint);
     result.branch = `wo/${wo.id}-${wo.attempts || 0}`;
     git(dir, 'switch', '--no-track', '-c', result.branch, base);
@@ -394,6 +391,25 @@ async function processWO(wo) {
     if (shot) fs.rm(shot, () => {});
     if (imgDir) fs.rm(imgDir, { recursive: true, force: true }, () => {});
   }
+}
+
+// Fetch origin/<target> lalu susulkan <target> lokal (hanya fast-forward). Tidak pernah melempar error.
+// Return true jika origin/<target> baru saja di-fetch (aman dipakai sebagai titik awal WO).
+// Lokal menyimpang (ada commit belum di-push) atau sedang di-checkout dengan perubahan = dibiarkan, hanya log.
+function syncTarget(dir, target) {
+  if (!target || !/^[\w][\w./-]*$/.test(target)) return false;
+  try { gitNet(dir, 'fetch', 'origin', target); }
+  catch (e) { log(`fetch origin/${target} di ${dir} gagal: ${tail(String(e.stderr || e.message), 200)}`); return false; }
+  try {
+    if (git(dir, 'rev-parse', '--abbrev-ref', 'HEAD') !== target) {
+      git(dir, 'fetch', '.', `refs/remotes/origin/${target}:refs/heads/${target}`); // update ref tanpa checkout; git menolak jika bukan fast-forward
+    } else if (git(dir, 'status', '--porcelain')) {
+      log(`${target} di ${dir} punya perubahan belum di-commit, tidak di-update`);
+    } else {
+      git(dir, 'merge', '--ff-only', `origin/${target}`);
+    }
+  } catch (e) { log(`${target} lokal di ${dir} tidak bisa di-fast-forward (menyimpang?), dibiarkan: ${tail(String(e.stderr || e.message), 200)}`); }
+  return true;
 }
 
 // File yang diubah WO dan juga diubah di origin/<target> sejak WO dibuat. Tidak kosong = jangan merge otomatis.
