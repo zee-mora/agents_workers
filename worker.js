@@ -111,7 +111,9 @@ function buildPrompt(wo, imgPaths = []) {
   const hint = (wo.files_hint || []).length ? `\n\nFile untuk dimulai:\n${wo.files_hint.join('\n')}` : '';
   const imgs = imgPaths.length ? `\n\nAttached images (read them with the Read tool):\n${imgPaths.join('\n')}` : '';
   const page = '\n\nJika perubahan terlihat di halaman web, akhiri jawaban dengan satu baris `PAGE: /path/halaman` (path saja, untuk screenshot).';
-  return `Context: ${wo.context}${goals}${hint}${imgs}${page}`;
+  const revs = wo.revision && Array.isArray(wo.revisions) ? wo.revisions : [];
+  const rev = revs.length ? `\n\nREVISI ke-${revs.length}: pekerjaan sebelumnya untuk WO ini sudah di-commit di branch yang sedang aktif (lihat \`git diff ${wo.revision.base_sha || 'HEAD~1'} HEAD\`). Reviewer meminta perbaikan; kerjakan catatan TERAKHIR, jangan mengulang dari nol:\n${revs.map((r, i) => `#${i + 1}: ${r.note}`).join('\n')}` : '';
+  return `Context: ${wo.context}${goals}${hint}${imgs}${rev}${page}`;
 }
 
 // Halaman yang disebut agent -> URL penuh di origin project. Hanya path; host selalu dari projects.json.
@@ -328,13 +330,25 @@ async function processWO(wo) {
     catch (e) { result.logs = `gagal mengunduh lampiran, WO tidak dijalankan: ${e.message}`; return false; }
 
     const baseBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
-    // Mulai dari origin/<target> terbaru, bukan HEAD lokal yang bisa tertinggal; kalau tidak, merge nanti
-    // bentrok dengan commit yang sudah ada di origin (MERGE_FAILED). Offline: pakai HEAD lokal.
-    const startPoint = syncTarget(dir, proj.target) ? `origin/${proj.target}` : 'HEAD';
-    if (proj.target && startPoint === 'HEAD') log(`WO ${wo.id} dimulai dari HEAD lokal (origin/${proj.target} tidak bisa di-fetch)`);
-    base = git(dir, 'rev-parse', startPoint);
-    result.branch = `wo/${wo.id}-${wo.attempts || 0}`;
-    git(dir, 'switch', '--no-track', '-c', result.branch, base);
+    if (wo.revision) { // revisi: lanjutkan branch WO yang direview, commit baru di atasnya
+      const rv = wo.revision;
+      if (!/^wo\/[\w.-]+$/.test(rv.branch || '') || !/^[0-9a-f]{7,40}$/.test(rv.head_sha || '')) { result.logs = 'revisi: branch/head_sha tidak valid'; return false; }
+      let head;
+      try { head = git(dir, 'rev-parse', '--verify', '--quiet', `refs/heads/${rv.branch}`); } catch { result.logs = `revisi: branch ${rv.branch} sudah tidak ada di laptop`; return false; }
+      if (!head.startsWith(rv.head_sha)) { result.logs = `revisi: branch ${rv.branch} berubah sejak direview (${head.slice(0, 8)} != ${rv.head_sha.slice(0, 8)})`; return false; }
+      base = /^[0-9a-f]{7,40}$/.test(rv.base_sha || '') ? rv.base_sha : git(dir, 'merge-base', rv.branch, 'HEAD'); // patch tetap seluruh WO, bukan hanya revisi
+      result.branch = rv.branch;
+      git(dir, 'switch', rv.branch);
+    } else {
+      // Mulai dari origin/<target> terbaru, bukan HEAD lokal yang bisa tertinggal; kalau tidak, merge nanti
+      // bentrok dengan commit yang sudah ada di origin (MERGE_FAILED). Offline: pakai HEAD lokal.
+      const startPoint = syncTarget(dir, proj.target) ? `origin/${proj.target}` : 'HEAD';
+      if (proj.target && startPoint === 'HEAD') log(`WO ${wo.id} dimulai dari HEAD lokal (origin/${proj.target} tidak bisa di-fetch)`);
+      base = git(dir, 'rev-parse', startPoint);
+      result.branch = `wo/${wo.id}-${wo.attempts || 0}`;
+      git(dir, 'switch', '--no-track', '-c', result.branch, base);
+    }
+    result.base_sha = base;
 
     const run = await runClaude(dir, buildPrompt(wo, imgPaths), wo, imgDir);
     result.exit_code = run.code;
@@ -357,7 +371,8 @@ async function processWO(wo) {
     if (!files.length) { result.status = 'FAILED'; result.logs = 'agent tidak mengubah file. ' + result.logs; return false; }
     if (files.some(unsafeFile)) { result.status = 'NEEDS_REVIEW'; result.logs = 'menyentuh .env/.git: ' + files.filter(unsafeFile).join(', '); return false; }
     const who = String(wo.created_by || 'unknown').replace(/[^\w.@-]/g, '_');
-    git(dir, 'commit', '-m', `WO-${who}-${new Date().toLocaleDateString('sv')}: ${wo.context}`.slice(0, 200), '-m', `WO ${wo.id}`); // format: WO-<pembuat>-<tanggal selesai>
+    const revTag = wo.revision ? ` (revisi ${wo.revision.n})` : '';
+    git(dir, 'commit', '-m', `WO-${who}-${new Date().toLocaleDateString('sv')}${revTag}: ${wo.context}`.slice(0, 200), '-m', `WO ${wo.id}`); // format: WO-<pembuat>-<tanggal selesai>
     result.diff_stat = git(dir, 'diff', '--stat', base, 'HEAD');
     result.head_sha = git(dir, 'rev-parse', 'HEAD'); // merge nanti hanya jika branch masih di commit ini
     try { result.patch = execFileSync('git', ['-C', dir, 'diff', base, 'HEAD'], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).slice(0, 200 * 1024); }
@@ -582,6 +597,9 @@ function selftest() {
   assert.ok(ip.includes('Attached images (read them with the Read tool):\n/tmp/x/a.png'));
   assert.ok(!buildPrompt({ context: 'c', goals: ['a'] }).includes('Attached images'));
   assert.ok(!buildPrompt({ context: 'c', goals: [] }).includes('Goals'));
+  const rp = buildPrompt({ context: 'c', revision: { n: 2, base_sha: 'abc1234' }, revisions: [{ note: 'satu' }, { note: 'dua' }] });
+  assert.ok(rp.includes('REVISI ke-2') && rp.includes('#2: dua') && rp.includes('git diff abc1234 HEAD'));
+  assert.ok(!buildPrompt({ context: 'c', revisions: [{ note: 'x' }] }).includes('REVISI'), 'tanpa revision: bukan revisi');
   assert.strictEqual(pageUrl('http://localhost:8000', 'selesai\nPAGE: /attendance'), 'http://localhost:8000/attendance');
   assert.strictEqual(pageUrl('http://localhost:8000', 'PAGE: //evil.com/x'), 'http://localhost:8000');
   assert.strictEqual(pageUrl('http://localhost:8000', 'tanpa halaman'), 'http://localhost:8000');
