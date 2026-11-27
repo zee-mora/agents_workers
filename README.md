@@ -93,7 +93,7 @@ Setelah admin menekan **Approve & merge** di `/orders`, VPS membuat job merge da
 ## Batas dan keamanan (jangan dilonggarkan tanpa alasan)
 
 - Worker tidak mempercayai VPS: budget maksimum $1, timeout maksimum 1800 detik, model hanya `haiku|sonnet|opus`.
-- `claude` dijalankan dengan `--allowedTools "Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*),Bash(python3:*)"`. Jangan beri `Bash` bebas. `python3` diizinkan agar agent bisa edit besar lewat skrip; ia tidak dibatasi sandbox, jadi hanya pakai di laptop dev.
+- `claude` dijalankan dengan `--allowedTools "Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*),Bash(python3:*),Bash(php -l:*),Bash(php artisan db:seed:*),Bash(php artisan test:*),Bash(php artisan route:list:*),Bash(composer dump-autoload:*)"`. `migrate:fresh/refresh/reset/rollback` dan `db:wipe` diblokir lewat `--disallowedTools` (`DENIED_TOOLS` di `worker.js`). Jangan beri `Bash` bebas. `python3` diizinkan agar agent bisa edit besar lewat skrip; ia tidak dibatasi sandbox, jadi hanya pakai di laptop dev.
 - `WORKER_TOKEN` dihapus dari environment proses `claude`.
 - URL screenshot hanya `localhost` dan `127.0.0.1`.
 - Tidak pernah commit ke branch utama. Rollback = hapus branch `wo/*`.

@@ -14,6 +14,8 @@ gzip -t "$tmp"
 [[ $(stat -c %s "$tmp") -gt 200 ]] || { echo "dump terlalu kecil, dibatalkan" >&2; exit 1; }
 if [[ $mode == --dump-only ]]; then echo "dump OK: $(stat -c %s "$tmp") byte (gz), tidak direstore"; exit 0; fi
 
-: "${SYNC_MYSQL_USER:?isi SYNC_MYSQL_USER di .env worker}" "${SYNC_MYSQL_PASSWORD:?isi SYNC_MYSQL_PASSWORD di .env worker}"
-gunzip -c "$tmp" | MYSQL_PWD=$SYNC_MYSQL_PASSWORD mysql -u"$SYNC_MYSQL_USER" "$local_db"
+: "${SYNC_MYSQL_USER:?isi SYNC_MYSQL_USER di .env worker}"
+# Password boleh kosong (mis. root XAMPP tanpa password); MYSQL_PWD hanya diset jika ada isinya.
+if [[ -n ${SYNC_MYSQL_PASSWORD:-} ]]; then export MYSQL_PWD=$SYNC_MYSQL_PASSWORD; fi
+gunzip -c "$tmp" | mysql -u"$SYNC_MYSQL_USER" "$local_db"
 echo "sync selesai: $(stat -c %s "$tmp") byte (gz)"

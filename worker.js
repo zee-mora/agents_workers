@@ -16,7 +16,9 @@ const PAUSE_MS = 10 * 60 * 1000;     // jeda saat kuota/login bermasalah
 const MAX_BUDGET = 1.0;              // batas keras sisi worker, tidak percaya nilai dari VPS
 const MAX_TIMEOUT = 1800;
 const MODELS = ['haiku', 'sonnet', 'opus'];
-const ALLOWED_TOOLS = 'Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*),Bash(python3:*)';
+const ALLOWED_TOOLS = 'Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(npm test:*),Bash(python3:*),Bash(php -l:*),Bash(php artisan db:seed:*),Bash(php artisan test:*),Bash(php artisan route:list:*),Bash(composer dump-autoload:*)';
+// Perintah destruktif database: diblokir eksplisit (deny menang atas allow).
+const DENIED_TOOLS = 'Bash(php artisan migrate:fresh:*),Bash(php artisan migrate:refresh:*),Bash(php artisan migrate:reset:*),Bash(php artisan db:wipe:*),Bash(php artisan migrate:rollback:*),Bash(php artisan db:seed --force:*)';
 const RULES = [
   '- Hanya kerjakan goals yang tertulis. Jangan refactor di luar itu.',
   '- Mulai dari file yang disarankan. Baca file sebelum mengubahnya; jangan menebak isinya.',
@@ -206,7 +208,7 @@ function runClaude(cwd, prompt, wo, addDir) {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--model', model,
     '--max-budget-usd', String(budget), '--permission-mode', 'acceptEdits',
     ...(addDir ? ['--add-dir', addDir] : []),
-    '--append-system-prompt', RULES, '--allowedTools', ALLOWED_TOOLS];
+    '--append-system-prompt', RULES, '--disallowedTools', DENIED_TOOLS, '--allowedTools', ALLOWED_TOOLS];
   const env = { ...process.env };
   delete env.WORKER_TOKEN; // agent tidak boleh melihat token VPS
   delete env.SYNC_MYSQL_USER; delete env.SYNC_MYSQL_PASSWORD; // dan tidak boleh melihat login MySQL untuk sync
