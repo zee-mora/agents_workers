@@ -108,11 +108,13 @@ function localUrlOk(u) {
   try { return ['localhost', '127.0.0.1'].includes(new URL(u).hostname); } catch { return false; }
 }
 
-function buildPrompt(wo, imgPaths = []) {
+function buildPrompt(wo, imgPaths = [], roles = null) {
   const goals = (wo.goals || []).length ? `\n\nGoals:\n${wo.goals.map((g, i) => `${i + 1}. ${g}`).join('\n')}` : '';
   const hint = (wo.files_hint || []).length ? `\n\nFile untuk dimulai:\n${wo.files_hint.join('\n')}` : '';
   const imgs = imgPaths.length ? `\n\nAttached images (read them with the Read tool):\n${imgPaths.join('\n')}` : '';
-  const page = '\n\nJika perubahan terlihat di halaman web, akhiri jawaban dengan satu baris `PAGE: /path/halaman` (path saja, untuk screenshot).';
+  const page = '\n\nJika perubahan terlihat di halaman web, akhiri jawaban dengan satu baris `PAGE: /path/halaman` (path saja, untuk screenshot).'
+    + ' Screenshot memakai akun developer. Jika halaman itu harus dilihat sebagai role atau user lain, tambahkan satu baris `AS: role <nama-role>` atau `AS: user <id-user>`.'
+    + (roles && Object.keys(roles).length ? `\nRole di DB lokal (role: contoh id user): ${Object.entries(roles).map(([r, id]) => `${r}: ${id ?? '-'}`).join(', ')}.` : ' (nama role Spatie, cek seeder/DB lokal)');
   const revs = wo.revision && Array.isArray(wo.revisions) ? wo.revisions : [];
   const rev = revs.length ? `\n\nREVISI ke-${revs.length}: pekerjaan sebelumnya untuk WO ini sudah di-commit di branch yang sedang aktif (lihat \`git diff ${wo.revision.base_sha || 'HEAD~1'} HEAD\`). Reviewer meminta perbaikan; kerjakan catatan TERAKHIR, jangan mengulang dari nol:\n${revs.map((r, i) => {
     const rg = (r.goals || []).length ? `\n   Goals: ${r.goals.join('; ')}` : '';
@@ -128,6 +130,46 @@ function pageUrl(base, text) {
   const m = /^PAGE:\s*(\/[^\s`]*)/m.exec(text || '');
   if (!m || m[1].startsWith('//')) return base;
   try { return new URL(m[1], base).href; } catch { return base; }
+}
+
+// Baris `AS: role <nama>` / `AS: user <id>` dari agent -> akun yang dipakai untuk foto (lewat fitur change-role / impersonate developer).
+function asTarget(text) {
+  const m = /^AS:\s*(role\s+[\w.-]{1,64}|user\s+\d{1,12})\s*$/m.exec(text || '');
+  if (!m) return null;
+  const [kind, value] = m[1].split(/\s+/);
+  return { kind, value };
+}
+
+// Daftar role + contoh id user dari DB lokal untuk prompt (null jika tidak bisa: tanpa login, bukan Laravel, DB remote, error).
+function listRoles(proj) {
+  if (!proj.login?.user || !fs.existsSync(path.join(proj.path, 'artisan'))) return null;
+  const envFile = path.join(proj.path, '.env');
+  const host = (fs.existsSync(envFile) ? /^DB_HOST=(.*)$/m.exec(fs.readFileSync(envFile, 'utf8')) : null)?.[1]?.trim().replace(/^["']|["']$/g, '');
+  if (!['127.0.0.1', 'localhost', '::1'].includes(host)) return null;
+  const { WORKER_TOKEN, ...env } = process.env;
+  const r = spawnSync('php', ['artisan', 'tinker', `--execute=require '${path.join(__dirname, 'scripts/list-roles.php')}';`],
+    { cwd: proj.path, env: { ...env, SHOT_LOGIN_USER: proj.login.user }, encoding: 'utf8', timeout: 60000 });
+  return parseRoles(r.stdout);
+}
+
+function parseRoles(out) {
+  const m = /^ROLES_JSON=(\{.*\})$/m.exec(out || '');
+  try { return m ? JSON.parse(m[1]) : null; } catch { return null; }
+}
+
+// Setelah login developer: ganti role (GET) atau impersonate user (POST + CSRF Laravel). Return pesan error atau null.
+async function switchAccount(page, base, login, as) {
+  if (as.kind === 'role') {
+    const res = await page.goto(new URL((login.role_path || '/change-role/{role}').replace('{role}', encodeURIComponent(as.value)), base).href, { waitUntil: 'networkidle', timeout: 15000 });
+    return res && res.status() >= 400 ? `ganti role "${as.value}" gagal (HTTP ${res.status()})` : null;
+  }
+  const target = new URL((login.impersonate_path || '/users/{user}/impersonate').replace('{user}', as.value), base).href;
+  const status = await page.evaluate(async (u) => {
+    const token = document.querySelector('meta[name="csrf-token"]')?.content || document.querySelector('input[name="_token"]')?.value || '';
+    const r = await fetch(u, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ _token: token }) });
+    return r.status;
+  }, target);
+  return status >= 400 ? `impersonate user ${as.value} gagal (HTTP ${status})` : null;
 }
 
 // ---------- VPS API ----------
@@ -260,7 +302,7 @@ function runSetup(proj) {
 
 const DEVICES = [{ name: 'Desktop', width: 1280, height: 800 }, { name: 'Tablet', width: 768, height: 1024 }, { name: 'HP', width: 390, height: 844 }];
 
-async function screenshot(url, viewport, out, storageState, login, proj) {
+async function screenshot(url, viewport, out, storageState, login, proj, as) {
   if (!localUrlOk(url)) return 'URL ditolak (hanya localhost/127.0.0.1)';
   let browser;
   try {
@@ -277,7 +319,8 @@ async function screenshot(url, viewport, out, storageState, login, proj) {
       await page.fill(login.password_selector || 'input[type="password"]', login.password);
       await Promise.all([page.waitForLoadState('networkidle'), page.press(login.password_selector || 'input[type="password"]', 'Enter')]);
       if (new URL(page.url()).pathname === new URL(login.path || '/login', url).pathname) return 'login gagal (kredensial salah / ada captcha atau 2FA)';
-    }
+      if (as) { const e = await switchAccount(page, url, login, as); if (e) return e; } // foto role yang salah lebih menyesatkan dari tanpa foto
+    } else if (as) return `AS: ${as.kind} ${as.value} diabaikan: project tanpa login.user/password`;
     // viewport dari WO = satu foto; tanpa itu: desktop + tablet + HP digabung jadi satu PNG (server hanya menerima satu gambar)
     const devs = viewport?.width ? [{ name: `${viewport.width}px`, ...viewport }] : DEVICES;
     const shots = [];
@@ -362,7 +405,7 @@ async function processWO(wo) {
     }
     result.base_sha = base;
 
-    const run = await runClaude(dir, buildPrompt(wo, imgPaths), wo, imgDir);
+    const run = await runClaude(dir, buildPrompt(wo, imgPaths, listRoles(proj)), wo, imgDir);
     result.exit_code = run.code;
     if (run.timedOut) { result.logs = 'timeout, proses dihentikan'; return false; }
 
@@ -400,7 +443,9 @@ async function processWO(wo) {
     const url = wo.verification?.target_url || proj.url;
     if (url) {
       shot = path.join(os.tmpdir(), `${wo.id}.png`);
-      const err = await withServer(proj, url, () => screenshot(pageUrl(url, pageText), wo.verification?.viewport, shot, proj.storage_state, proj.login, proj));
+      const as = asTarget(pageText);
+      const err = await withServer(proj, url, () => screenshot(pageUrl(url, pageText), wo.verification?.viewport, shot, proj.storage_state, proj.login, proj, as));
+      if (as) result.logs += `\n[screenshot sebagai ${as.kind} ${as.value}]`;
       if (err) result.logs += `\n[${err}]`; // screenshot gagal tidak menggagalkan WO
     }
     result.status = 'COMPLETED';
@@ -621,6 +666,15 @@ function selftest() {
   assert.strictEqual(pageUrl('http://localhost:8000', 'selesai\nPAGE: /attendance'), 'http://localhost:8000/attendance');
   assert.strictEqual(pageUrl('http://localhost:8000', 'PAGE: //evil.com/x'), 'http://localhost:8000');
   assert.strictEqual(pageUrl('http://localhost:8000', 'tanpa halaman'), 'http://localhost:8000');
+  assert.deepStrictEqual(asTarget('PAGE: /x\nAS: role finance_staff'), { kind: 'role', value: 'finance_staff' });
+  assert.deepStrictEqual(asTarget('AS: user 42'), { kind: 'user', value: '42' });
+  assert.deepStrictEqual(parseRoles('Psy\nROLES_JSON={"admin":3,"finance":null}\n'), { admin: 3, finance: null });
+  assert.strictEqual(parseRoles('error'), null);
+  assert.ok(buildPrompt({ context: 'c' }, [], { admin: 3, finance: null }).includes('admin: 3, finance: -'));
+  assert.ok(buildPrompt({ context: 'c' }).includes('cek seeder/DB lokal'));
+  assert.strictEqual(asTarget('AS: user abc'), null);
+  assert.strictEqual(asTarget('AS: role ../../logout'), null);
+  assert.strictEqual(asTarget('tanpa AS'), null);
   const ui = require('./ui');
   const tu = (name, input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input }] } });
   assert.deepStrictEqual(ui.summarize(tu('Edit', { file_path: '/home/x/proj/app/Foo.php' }), '/home/x/proj'), ['Edit app/Foo.php']);
