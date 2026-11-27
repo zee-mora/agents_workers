@@ -4,3 +4,4 @@ node_modules
 .login/
 
 .claude/settings.local.json
+.sync/
