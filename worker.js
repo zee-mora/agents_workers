@@ -437,12 +437,16 @@ function syncTarget(dir, target) {
   return true;
 }
 
-// File yang diubah WO dan juga diubah di origin/<target> sejak WO dibuat. Tidak kosong = jangan merge otomatis.
+// File yang benar-benar konflik jika WO di-merge ke origin/<target> (uji merge tanpa menyentuh working tree).
+// File yang sama boleh diubah di kedua sisi selama bagiannya berbeda. Tidak kosong = jangan merge otomatis.
 function mergeClash(dir, branch, target) {
-  const mb = git(dir, 'merge-base', branch, `origin/${target}`);
-  const files = (ref) => new Set(git(dir, 'diff', '--name-only', mb, ref).split('\n').filter(Boolean));
-  const theirs = files(`origin/${target}`);
-  return [...files(branch)].filter((f) => theirs.has(f));
+  try {
+    git(dir, 'merge-tree', '--write-tree', '--name-only', '--no-messages', `origin/${target}`, branch);
+    return [];
+  } catch (e) {
+    if (e.status !== 1) throw e; // 1 = ada konflik; selain itu error sungguhan
+    return [...new Set(String(e.stdout).split('\n').slice(1).map((s) => s.trim()).filter(Boolean))];
+  }
 }
 
 const gitNet = (dir, ...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8', timeout: 60000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -470,7 +474,7 @@ async function processMerge(wo) {
     origBranch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD');
     gitNet(dir, 'fetch', 'origin', proj.target);
     const clash = mergeClash(dir, r.branch, proj.target);
-    if (clash.length) throw new Error(`file ini juga diubah di ${proj.target} sejak WO dibuat: ${clash.join(', ')}. Buat WO baru dari ${proj.target} terbaru atau merge manual.`);
+    if (clash.length) throw new Error(`file ini konflik dengan perubahan di ${proj.target} sejak WO dibuat: ${clash.join(', ')}. Buat WO baru dari ${proj.target} terbaru atau merge manual.`);
     git(dir, 'switch', proj.target);
     targetPrev = git(dir, 'rev-parse', 'HEAD');
     try { git(dir, 'merge', '--ff-only', `origin/${proj.target}`); } // susul origin; menyimpang = berhenti
@@ -660,7 +664,13 @@ function selftest() {
   g('switch', '-q', 'main'); commit('b.txt', 'b1');                          // orang lain mengubah b.txt
   g('update-ref', 'refs/remotes/origin/main', 'main');
   assert.deepStrictEqual(mergeClash(tmp, 'wo/x', 'main'), [], 'file berbeda: tidak bentrok');
-  commit('a.txt', 'a2');                                                     // orang lain juga mengubah a.txt
+  g('switch', '-q', '-c', 'wo/z', base0); commit('m.txt', 'z1\n2\n3\n4\n5\n6\n7\n8\n9\n0\n'); // file sama, bagian berbeda
+  g('switch', '-q', '-c', 'wo/z2'); commit('m.txt', 'z1\n2\n3\n4\n5\n6\n7\n8\n9\nWO\n');
+  g('switch', '-q', 'wo/z'); commit('m.txt', 'MAIN\n2\n3\n4\n5\n6\n7\n8\n9\n0\n');
+  g('update-ref', 'refs/remotes/origin/z', 'wo/z');
+  assert.deepStrictEqual(mergeClash(tmp, 'wo/z2', 'z'), [], 'file sama, bagian berbeda: tidak bentrok');
+  g('switch', '-q', 'main');
+  commit('a.txt', 'a2');                                                    // orang lain juga mengubah a.txt
   g('update-ref', 'refs/remotes/origin/main', 'main');
   assert.deepStrictEqual(mergeClash(tmp, 'wo/x', 'main'), ['a.txt'], 'file sama: bentrok');
   assert.ok(base0);
